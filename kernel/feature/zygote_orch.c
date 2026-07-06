@@ -10,13 +10,22 @@
  */
 
 #include <linux/cred.h>
+#include <linux/errno.h>
+#include <linux/compat.h>
 #include <linux/rcupdate.h>
 #include <linux/sched.h>
 #include <linux/spinlock.h>
 #include <linux/tracepoint.h>
 #include <linux/types.h>
+#include <linux/uidgid.h>
+#include <linux/workqueue.h>
 
+#include <asm/syscall.h>
+#include <asm/unistd.h>
 #include <trace/events/sched.h>
+#ifdef CONFIG_HAVE_SYSCALL_TRACEPOINTS
+#include <trace/events/syscalls.h>
+#endif
 
 #include "feature/zygote_orch.h"
 #include "feature/zygote_nl.h"
@@ -39,6 +48,24 @@ struct zo_child {
 #define ZO_MAX_CHILDREN 512
 static struct zo_child zo_children[ZO_MAX_CHILDREN];
 static DEFINE_SPINLOCK(zo_lock);
+static bool zo_trace_sys_exit_registered;
+
+struct zo_specialize_event {
+	pid_t pid;
+	uid_t uid;
+	u32 appid;
+};
+
+#define ZO_MAX_SPECIALIZE_EVENTS 128
+static struct zo_specialize_event
+	zo_specialize_events[ZO_MAX_SPECIALIZE_EVENTS];
+static unsigned int zo_specialize_head;
+static unsigned int zo_specialize_tail;
+static unsigned int zo_specialize_dropped;
+static bool zo_specialize_work_queued;
+static DEFINE_SPINLOCK(zo_event_lock);
+static void zo_specialize_work_fn(struct work_struct *work);
+static DECLARE_WORK(zo_specialize_work, zo_specialize_work_fn);
 
 /* caller holds zo_lock */
 static int zo_slot_of(pid_t pid)
@@ -66,6 +93,166 @@ static void zo_track(pid_t pid)
 		}
 	}
 	spin_unlock_irqrestore(&zo_lock, flags);
+}
+
+static void zo_queue_specialize_event(pid_t pid, uid_t uid, u32 appid)
+{
+	unsigned long flags;
+	bool schedule = false;
+	unsigned int next;
+
+	spin_lock_irqsave(&zo_event_lock, flags);
+	next = (zo_specialize_head + 1) % ZO_MAX_SPECIALIZE_EVENTS;
+	if (next == zo_specialize_tail) {
+		zo_specialize_dropped++;
+	} else {
+		zo_specialize_events[zo_specialize_head].pid = pid;
+		zo_specialize_events[zo_specialize_head].uid = uid;
+		zo_specialize_events[zo_specialize_head].appid = appid;
+		zo_specialize_head = next;
+	}
+	if (!zo_specialize_work_queued) {
+		zo_specialize_work_queued = true;
+		schedule = true;
+	}
+	spin_unlock_irqrestore(&zo_event_lock, flags);
+
+	if (schedule)
+		schedule_work(&zo_specialize_work);
+}
+
+static bool zo_pop_specialize_event(struct zo_specialize_event *event,
+				    unsigned int *dropped)
+{
+	unsigned long flags;
+	bool have_event = false;
+
+	spin_lock_irqsave(&zo_event_lock, flags);
+	if (zo_specialize_tail != zo_specialize_head) {
+		*event = zo_specialize_events[zo_specialize_tail];
+		zo_specialize_tail =
+			(zo_specialize_tail + 1) % ZO_MAX_SPECIALIZE_EVENTS;
+		have_event = true;
+	} else {
+		*dropped = zo_specialize_dropped;
+		zo_specialize_dropped = 0;
+		if (!*dropped)
+			zo_specialize_work_queued = false;
+	}
+	spin_unlock_irqrestore(&zo_event_lock, flags);
+	return have_event;
+}
+
+static void zo_specialize_work_fn(struct work_struct *work)
+{
+	struct zo_specialize_event event;
+	unsigned int dropped = 0;
+
+	(void)work;
+
+	for (;;) {
+		dropped = 0;
+		if (zo_pop_specialize_event(&event, &dropped)) {
+			pr_info("zygote_orch: [specialize] pid=%d uid=%u appid=%u\n",
+				event.pid, event.uid, event.appid);
+			yz_zygote_nl_emit_specialize(event.pid, event.appid);
+			continue;
+		}
+		if (dropped) {
+			pr_warn("zygote_orch: dropped %u specialize event(s)\n",
+				dropped);
+			continue;
+		}
+		break;
+	}
+}
+
+static void zo_specialize_events_reset(void)
+{
+	unsigned long flags;
+
+	cancel_work_sync(&zo_specialize_work);
+
+	spin_lock_irqsave(&zo_event_lock, flags);
+	zo_specialize_head = 0;
+	zo_specialize_tail = 0;
+	zo_specialize_dropped = 0;
+	zo_specialize_work_queued = false;
+	spin_unlock_irqrestore(&zo_event_lock, flags);
+}
+
+#ifdef CONFIG_HAVE_SYSCALL_TRACEPOINTS
+static void zo_on_sys_exit(void *data, struct pt_regs *regs, long ret)
+{
+	int nr;
+
+	(void)data;
+
+	if (ret < 0)
+		return;
+#ifdef CONFIG_COMPAT
+	if (is_compat_task())
+		return;
+#endif
+
+	nr = syscall_get_nr(current, regs);
+	if (nr != __NR_setresuid)
+		return;
+
+	yz_zygote_orch_on_setresuid((uid_t)-1, current_uid().val);
+}
+
+static int zo_tracepoint_init(void)
+{
+	int ret;
+
+	ret = register_trace_sys_exit(zo_on_sys_exit, NULL);
+	if (ret)
+		return ret;
+	zo_trace_sys_exit_registered = true;
+	pr_info("zygote_orch: setresuid sys_exit monitor armed\n");
+	return 0;
+}
+
+static void zo_tracepoint_exit(void)
+{
+	if (!zo_trace_sys_exit_registered)
+		return;
+	unregister_trace_sys_exit(zo_on_sys_exit, NULL);
+	tracepoint_synchronize_unregister();
+	zo_trace_sys_exit_registered = false;
+}
+#else
+static int zo_tracepoint_init(void)
+{
+	return -EOPNOTSUPP;
+}
+
+static void zo_tracepoint_exit(void)
+{
+}
+#endif
+
+static void zo_setresuid_monitor_init(void)
+{
+#ifdef __NR_setresuid
+	int ret;
+
+	ret = zo_tracepoint_init();
+	if (!ret)
+		return;
+
+	pr_warn("zygote_orch: sys_exit monitor unavailable: %d; "
+		"setresuid specialize events disabled\n",
+		ret);
+#else
+	pr_warn("zygote_orch: __NR_setresuid unavailable; specialize events disabled\n");
+#endif
+}
+
+static void zo_setresuid_monitor_exit(void)
+{
+	zo_tracepoint_exit();
 }
 
 #ifdef CONFIG_TRACEPOINTS
@@ -136,11 +323,14 @@ void yz_zygote_orch_init(void)
 		return;
 	}
 
+	zo_setresuid_monitor_init();
 	pr_info("zygote_orch: lifecycle state machine armed\n");
 }
 
 void yz_zygote_orch_exit(void)
 {
+	zo_setresuid_monitor_exit();
+	zo_specialize_events_reset();
 	unregister_trace_sched_process_fork(zo_on_fork, NULL);
 	unregister_trace_sched_process_free(zo_on_free, NULL);
 	tracepoint_synchronize_unregister();
@@ -191,8 +381,6 @@ void yz_zygote_orch_on_setresuid(uid_t old_uid, uid_t new_uid)
 	spin_unlock_irqrestore(&zo_lock, flags);
 
 	if (specialized) {
-		pr_info("zygote_orch: [specialize] pid=%d uid=%u appid=%u\n",
-			pid, new_uid, new_uid % 100000);
-		yz_zygote_nl_emit_specialize(pid, new_uid % 100000);
+		zo_queue_specialize_event(pid, new_uid, new_uid % 100000);
 	}
 }
