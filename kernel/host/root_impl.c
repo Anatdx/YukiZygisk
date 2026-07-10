@@ -15,7 +15,10 @@
 #include <linux/kernel.h>
 #include <linux/list.h>
 #include <linux/mm.h>
+#include <linux/moduleparam.h>
+#include <linux/mutex.h>
 #include <linux/rbtree.h>
+#include <linux/rcupdate.h>
 #include <linux/slab.h>
 #include <linux/spinlock.h>
 #include <linux/string.h>
@@ -24,6 +27,7 @@
 
 #include "host/root_impl.h"
 #include "host/runtime.h"
+#include "uapi/yukizygisk.h"
 
 #define YZ_KP_SYMBOL_NAME_LEN 32
 #define YZ_KP_SYMBOL_SIZE 48
@@ -79,10 +83,28 @@ struct yz_kp_vmap_node {
 	unsigned long nr_purged;
 };
 
+struct yz_policy_cache {
+	u32 owner;
+	u32 generation;
+	u32 count;
+	u32 manager_appid;
+	bool complete;
+	bool default_should_umount;
+	struct yz_policy_cache_entry entries[];
+};
+
 int yz_root_mask;
 int yz_ksu_dispatcher_nr = -1;
 enum yz_root_owner yz_root_owner = YZ_ROOT_OWNER_NONE;
 bool yz_root_policy_allowed;
+static bool yz_root_policy_fallback;
+static bool yz_force_policy_fallback;
+module_param_named(force_policy_fallback, yz_force_policy_fallback, bool,
+		   0600);
+MODULE_PARM_DESC(force_policy_fallback,
+		 "Force the authenticated userspace denylist cache backend.");
+static DEFINE_MUTEX(yz_policy_cache_lock);
+static struct yz_policy_cache __rcu *yz_policy_cache;
 yz_ksu_is_allow_uid_fn yz_ksu_is_allow_uid_ptr;
 yz_ksu_uid_should_umount_fn yz_ksu_uid_should_umount_ptr;
 yz_ksu_get_allow_list_fn yz_ksu_get_allow_list_ptr;
@@ -117,6 +139,154 @@ static YZ_INDIRECT_CALL void yz_close_file(struct file *file)
 		yz_filp_close(file, NULL);
 	else
 		fput(file);
+}
+
+static void yz_policy_cache_clear(void)
+{
+	struct yz_policy_cache *old;
+
+	mutex_lock(&yz_policy_cache_lock);
+	old = rcu_dereference_protected(
+		yz_policy_cache, lockdep_is_held(&yz_policy_cache_lock));
+	RCU_INIT_POINTER(yz_policy_cache, NULL);
+	mutex_unlock(&yz_policy_cache_lock);
+	if (old) {
+		synchronize_rcu();
+		kvfree(old);
+	}
+}
+
+int yz_host_install_policy_cache(struct file *file)
+{
+	struct yz_policy_cache_header header;
+	struct yz_policy_cache *cache;
+	struct yz_policy_cache *old;
+	loff_t pos = 0;
+	loff_t file_size;
+	size_t alloc_size;
+	size_t payload_size;
+	ssize_t n;
+	u32 i;
+
+	BUILD_BUG_ON(sizeof(struct yz_policy_cache_header) != 32);
+	BUILD_BUG_ON(sizeof(struct yz_policy_cache_entry) != 8);
+
+	if (!file || !READ_ONCE(yz_root_policy_fallback))
+		return -EOPNOTSUPP;
+
+	file_size = i_size_read(file_inode(file));
+	n = yz_kernel_read(file, &header, sizeof(header), &pos);
+	if (n != sizeof(header))
+		return n < 0 ? (int)n : -EINVAL;
+	if (header.magic != YZ_POLICY_CACHE_MAGIC ||
+	    header.version != YZ_POLICY_CACHE_VERSION ||
+	    header.header_size != sizeof(header) ||
+	    header.entry_size != sizeof(struct yz_policy_cache_entry) ||
+	    header.count > YZ_POLICY_CACHE_MAX_ENTRIES ||
+	    header.flags & ~YZ_POLICY_CACHE_F_COMPLETE ||
+	    header.default_should_umount > 1 ||
+	    (header.manager_appid != YZ_POLICY_REFRESH_ALL &&
+	     header.manager_appid >= 100000) ||
+	    header.owner != (u32)READ_ONCE(yz_root_owner))
+		return -EINVAL;
+
+	payload_size = (size_t)header.count *
+		       sizeof(struct yz_policy_cache_entry);
+	if (file_size != (loff_t)(sizeof(header) + payload_size))
+		return -EINVAL;
+
+	alloc_size = sizeof(*cache) + payload_size;
+	cache = kvzalloc(alloc_size, GFP_KERNEL);
+	if (!cache)
+		return -ENOMEM;
+	cache->owner = header.owner;
+	cache->generation = header.generation;
+	cache->count = header.count;
+	cache->manager_appid = header.manager_appid;
+	cache->complete = !!(header.flags & YZ_POLICY_CACHE_F_COMPLETE);
+	cache->default_should_umount = header.default_should_umount != 0;
+
+	if (payload_size) {
+		n = yz_kernel_read(file, cache->entries, payload_size, &pos);
+		if (n != payload_size) {
+			kvfree(cache);
+			return n < 0 ? (int)n : -EINVAL;
+		}
+	}
+
+	for (i = 0; i < cache->count; i++) {
+		if (cache->entries[i].should_umount > 1 ||
+		    (i > 0 && cache->entries[i - 1].uid >=
+				      cache->entries[i].uid)) {
+			kvfree(cache);
+			return -EINVAL;
+		}
+	}
+
+	mutex_lock(&yz_policy_cache_lock);
+	if (!yz_root_policy_fallback ||
+	    cache->owner != (u32)yz_root_owner) {
+		mutex_unlock(&yz_policy_cache_lock);
+		kvfree(cache);
+		return -ESTALE;
+	}
+	old = rcu_dereference_protected(
+		yz_policy_cache, lockdep_is_held(&yz_policy_cache_lock));
+	rcu_assign_pointer(yz_policy_cache, cache);
+	pr_info("yukizygisk: userspace policy cache owner=%u generation=%u entries=%u complete=%u default=%u\n",
+		cache->owner, cache->generation, cache->count,
+		cache->complete ? 1 : 0,
+		cache->default_should_umount ? 1 : 0);
+	mutex_unlock(&yz_policy_cache_lock);
+	if (old) {
+		synchronize_rcu();
+		kvfree(old);
+	}
+	return 0;
+}
+
+static int yz_policy_cache_lookup(uid_t uid, bool *should_umount)
+{
+	const struct yz_policy_cache *cache;
+	u32 low = 0;
+	u32 high;
+	int ret = -EAGAIN;
+
+	rcu_read_lock();
+	cache = rcu_dereference(yz_policy_cache);
+	if (!cache)
+		goto out;
+	if (cache->manager_appid != YZ_POLICY_REFRESH_ALL &&
+	    (u32)uid % 100000 == cache->manager_appid) {
+		*should_umount = false;
+		ret = 0;
+		goto out;
+	}
+
+	high = cache->count;
+	while (low < high) {
+		u32 mid = low + (high - low) / 2;
+		u32 cached_uid = cache->entries[mid].uid;
+
+		if (cached_uid < (u32)uid) {
+			low = mid + 1;
+		} else if (cached_uid > (u32)uid) {
+			high = mid;
+		} else {
+			*should_umount =
+				cache->entries[mid].should_umount != 0;
+			ret = 0;
+			goto out;
+		}
+	}
+
+	if (cache->complete) {
+		*should_umount = cache->default_should_umount;
+		ret = 0;
+	}
+out:
+	rcu_read_unlock();
+	return ret;
 }
 
 static void yz_ap_clear_symbols(void)
@@ -499,15 +669,6 @@ static bool yz_magisk_detect(void)
 	return false;
 }
 
-static int yz_ksu_prepare_denylist(void)
-{
-	if (yz_ksu_uid_should_umount_ptr) {
-		pr_info("yukizygisk: KernelSU denylist backend: kallsyms callable ksu_uid_should_umount\n");
-		return 0;
-	}
-	return -EOPNOTSUPP;
-}
-
 int yz_host_root_detect(void)
 {
 	bool ksu_seen;
@@ -515,25 +676,31 @@ int yz_host_root_detect(void)
 	bool apatch_seen;
 	bool magisk_seen;
 	int active_roots = 0;
-	int ret;
 
+	yz_policy_cache_clear();
 	yz_root_mask = YZ_ROOT_NONE;
 	yz_ksu_dispatcher_nr = -1;
 	yz_root_owner = YZ_ROOT_OWNER_NONE;
 	yz_root_policy_allowed = false;
+	yz_root_policy_fallback = false;
 	yz_ksu_is_allow_uid_ptr = NULL;
 	yz_ksu_uid_should_umount_ptr = NULL;
 	yz_ksu_get_allow_list_ptr = NULL;
 
 	ksu_seen = yz_ksu_detect(&ksu_policy_available);
 	if (ksu_seen && !ksu_policy_available)
-		pr_warn("yukizygisk: KernelSU detected without allowlist policy source\n");
+		pr_warn("yukizygisk: KernelSU callable policy unavailable; userspace cache required\n");
 
 	if (yz_apatch_detect()) {
 		yz_root_mask |= YZ_ROOT_APATCH;
 		apatch_seen = true;
 	} else {
 		apatch_seen = false;
+	}
+	if (yz_force_policy_fallback) {
+		ksu_policy_available = false;
+		yz_ksu_uid_should_umount_ptr = NULL;
+		yz_ap_get_mod_exclude = NULL;
 	}
 
 	magisk_seen = yz_magisk_detect();
@@ -553,31 +720,23 @@ int yz_host_root_detect(void)
 	}
 
 	if (ksu_seen) {
-		if (!ksu_policy_available) {
-			pr_err("yukizygisk: KernelSU has no readable denylist backend, refusing to load\n");
-			return -EOPNOTSUPP;
-		}
-		ret = yz_ksu_prepare_denylist();
-		if (ret) {
-			pr_err("yukizygisk: KernelSU denylist backend init failed: %d\n",
-			       ret);
-			return ret;
-		}
 		yz_root_owner = YZ_ROOT_OWNER_KERNELSU;
 		yz_root_policy_allowed = true;
-		pr_info("yukizygisk: root owner accepted: KernelSU%s\n",
-			(yz_root_mask & YZ_ROOT_KSU_RDR) ? " (redirect)" : "");
+		yz_root_policy_fallback = !ksu_policy_available;
+		pr_info("yukizygisk: root owner accepted: KernelSU%s policy=%s\n",
+			(yz_root_mask & YZ_ROOT_KSU_RDR) ? " (redirect)" : "",
+			yz_root_policy_fallback ? "userspace-fallback" :
+						  "kernel-callable");
 		return 0;
 	}
 
 	if (apatch_seen) {
-		if (!yz_ap_get_mod_exclude) {
-			pr_err("yukizygisk: KernelPatch has no readable denylist backend, refusing to load\n");
-			return -EOPNOTSUPP;
-		}
 		yz_root_owner = YZ_ROOT_OWNER_KERNELPATCH;
 		yz_root_policy_allowed = true;
-		pr_info("yukizygisk: root owner accepted: KernelPatch\n");
+		yz_root_policy_fallback = !yz_ap_get_mod_exclude;
+		pr_info("yukizygisk: root owner accepted: KernelPatch policy=%s\n",
+			yz_root_policy_fallback ? "userspace-fallback" :
+						  "kernel-callable");
 		return 0;
 	}
 
@@ -597,21 +756,41 @@ bool yz_host_root_allows_policy(void)
 	return READ_ONCE(yz_root_policy_allowed);
 }
 
-YZ_INDIRECT_CALL bool yz_host_uid_should_umount(uid_t uid)
+bool yz_host_policy_uses_fallback(void)
 {
+	return READ_ONCE(yz_root_policy_fallback);
+}
+
+bool yz_host_policy_cache_ready(void)
+{
+	return rcu_access_pointer(yz_policy_cache) != NULL;
+}
+
+YZ_INDIRECT_CALL int yz_host_uid_should_umount(uid_t uid,
+					       bool *should_umount)
+{
+	if (!should_umount)
+		return -EINVAL;
+	*should_umount = false;
 	if (uid == 0 || !READ_ONCE(yz_root_policy_allowed))
-		return false;
+		return 0;
 
 	switch (READ_ONCE(yz_root_owner)) {
 	case YZ_ROOT_OWNER_KERNELSU:
-		if (yz_ksu_uid_should_umount_ptr)
-			return yz_ksu_uid_should_umount_ptr(uid);
-		return false;
+		if (yz_ksu_uid_should_umount_ptr) {
+			*should_umount = yz_ksu_uid_should_umount_ptr(uid);
+			return 0;
+		}
+		return yz_policy_cache_lookup(uid, should_umount);
 	case YZ_ROOT_OWNER_KERNELPATCH:
-		return yz_ap_get_mod_exclude && yz_ap_get_mod_exclude(uid) != 0;
+		if (yz_ap_get_mod_exclude) {
+			*should_umount = yz_ap_get_mod_exclude(uid) != 0;
+			return 0;
+		}
+		return yz_policy_cache_lookup(uid, should_umount);
 	case YZ_ROOT_OWNER_NONE:
 	default:
-		return false;
+		return -EOPNOTSUPP;
 	}
 }
 
@@ -631,14 +810,25 @@ const char *yz_host_root_name(void)
 
 u32 yz_host_root_flags(void)
 {
-	return (yz_root_mask & YZ_ROOT_KSU_RDR) ?
-		YZ_ROOT_FLAG_KSU_REDIRECT : 0;
+	u32 flags = 0;
+
+	if (yz_root_mask & YZ_ROOT_KSU_RDR)
+		flags |= YZ_ROOT_FLAG_KSU_REDIRECT;
+	if (yz_root_policy_fallback)
+		flags |= YZ_ROOT_STATUS_POLICY_FALLBACK;
+	else if (yz_root_policy_allowed)
+		flags |= YZ_ROOT_STATUS_POLICY_KERNEL;
+	if (yz_host_policy_cache_ready())
+		flags |= YZ_ROOT_STATUS_POLICY_CACHE_READY;
+	return flags;
 }
 
 void yz_host_root_exit(void)
 {
 	yz_root_policy_allowed = false;
+	yz_root_policy_fallback = false;
 	yz_root_owner = YZ_ROOT_OWNER_NONE;
+	yz_policy_cache_clear();
 	yz_ksu_is_allow_uid_ptr = NULL;
 	yz_ksu_uid_should_umount_ptr = NULL;
 	yz_ksu_get_allow_list_ptr = NULL;

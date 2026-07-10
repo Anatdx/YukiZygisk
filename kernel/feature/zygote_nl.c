@@ -64,6 +64,11 @@ void yz_zygote_nl_emit_safemode(u32 pid, u32 crashes)
 	yz_zygote_nl_emit_event(YZ_EV_SAFEMODE, pid, crashes);
 }
 
+void yz_zygote_nl_emit_policy_refresh(u32 owner, u32 uid)
+{
+	yz_zygote_nl_emit_event(YZ_EV_POLICY_REFRESH, owner, uid);
+}
+
 void yz_zygote_nl_init(void)
 {
 	struct netlink_kernel_cfg cfg = {

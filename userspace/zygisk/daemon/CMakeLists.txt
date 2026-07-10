@@ -6,7 +6,10 @@
 #
 # Author: Anatdx
 
-add_executable(zygiskd zygiskd.cpp)
+add_executable(zygiskd
+  root_policy.cpp
+  zygiskd.cpp
+)
 
 target_compile_features(zygiskd PRIVATE cxx_std_17)
 target_include_directories(

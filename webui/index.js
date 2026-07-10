@@ -118,6 +118,16 @@ function rootImplLabel() {
   return t(labels[state.status.root_impl] || "common.unknown");
 }
 
+function policySourceLabel() {
+  const labels = {
+    kernel: "policy.kernel",
+    "userspace-ksu-api": "policy.ksuUserspace",
+    "userspace-apatch-config": "policy.apatchUserspace",
+    unavailable: "common.unknown",
+  };
+  return t(labels[state.status.root_policy_source] || "common.unknown");
+}
+
 function stateBadge(value) {
   const tones = { injected: "success", failed: "danger", crashed: "warning", unsupported32: "muted" };
   return `<span class="badge ${tones[value] || "muted"}">${escapeHtml(t(`state.${value}`, value))}</span>`;
@@ -195,7 +205,8 @@ function renderStatus() {
       ${sectionHeader(t("status.runtimeInfo"), t("status.runtimeInfoDesc"))}
       <dl class="info-grid single">
         ${infoItem(t("status.rootImpl"), rootImplLabel())}
-        ${infoItem(t("status.denylistSource"), rootImplLabel())}
+        ${infoItem(t("status.denylistSource"), policySourceLabel())}
+        ${state.status.root_policy_source !== "kernel" ? infoItem(t("status.policyCache"), t(state.status.root_policy_cache_ready ? "policy.ready" : "policy.pending")) : ""}
         ${infoItem(t("common.abi"), state.status.abi || "—")}
         ${infoItem(t("status.daemonPid"), state.status.daemon_pid || "—")}
       </dl>
@@ -238,6 +249,8 @@ function renderSettings() {
       ${sectionHeader(t("settings.policyTitle"), t("settings.policyDesc"))}
       <dl class="info-grid">
         ${infoItem(t("settings.policyOwner"), rootImplLabel())}
+        ${infoItem(t("status.denylistSource"), policySourceLabel())}
+        ${state.status.root_policy_source !== "kernel" ? infoItem(t("status.policyCache"), t(state.status.root_policy_cache_ready ? "policy.ready" : "policy.pending")) : ""}
         ${infoItem(t("settings.configPath"), PATHS.CONFIG, true)}
       </dl>
     </section>

@@ -70,7 +70,11 @@ early-native injection by default; that capability can remain a future optional
 host backend rather than the baseline standalone path.
 
 The packaged WebUI has three pages: device/injection status, configuration,
-and about/credits. It does not keep a second denylist. When denylist handling is
-enabled, zygiskd asks the accepted KernelSU or KernelPatch backend about each
-full UID and the WebUI only selects whether matching processes skip injection
-or keep injection before mount cleanup.
+and about/credits. It does not own a separately configured denylist. The
+preferred path asks the accepted KernelSU or KernelPatch backend through a
+CFI-safe kernel callable. If that callable cannot be resolved, the kernel asks
+zygiskd for a refresh over netlink: zygiskd uses KernelSU's userspace
+ioctl/prctl policy API or parses APatch's `package_config`, then atomically
+hands a bounded snapshot back through a sealed memfd on the authenticated
+anonymous control fd. The WebUI only selects whether matching processes skip
+injection or keep injection before mount cleanup.

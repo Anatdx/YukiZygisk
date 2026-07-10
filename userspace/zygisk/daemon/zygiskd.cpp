@@ -9,6 +9,7 @@
 
 #include "zygiskd.hpp"
 #include "native_modules.hpp"
+#include "root_policy.hpp"
 #include "uapi/yukizygisk.h"
 
 #include "json.hpp"
@@ -273,10 +274,20 @@ bool get_root_status(yz_root_status_cmd *status) {
 }
 
 bool uid_should_umount(uint32_t uid) {
+  if (yzpolicy::active())
+    (void)yzpolicy::refresh(false);
   yz_uid_policy_cmd cmd{};
   cmd.uid = uid;
-  return ctl(YZ_IOCTL_UID_SHOULD_UMOUNT, &cmd) == 0 &&
-         cmd.should_umount != 0;
+  if (ctl(YZ_IOCTL_UID_SHOULD_UMOUNT, &cmd) == 0)
+    return cmd.should_umount != 0;
+
+  int saved_errno = errno;
+  bool decision = false;
+  if (saved_errno == EAGAIN && yzpolicy::query_uid(uid, &decision))
+    return decision;
+  DLOGE("UID policy unavailable uid=%u errno=%d (%s)", uid, saved_errno,
+        strerror(saved_errno));
+  return false;
 }
 
 bool lsetfilecon(const std::string &path, const char *context) {
@@ -1398,6 +1409,14 @@ std::string build_status_json() {
         (root_status.flags & YZ_ROOT_STATUS_KSU_REDIRECT) != 0)
            ? "true"
            : "false";
+  s += ",\"root_policy_source\":\"";
+  json_append_escaped(s, yzpolicy::source_name());
+  s += "\"";
+  s += ",\"root_policy_cache_ready\":";
+  s += (root_status_ok &&
+        (root_status.flags & YZ_ROOT_STATUS_POLICY_CACHE_READY) != 0)
+           ? "true"
+           : "false";
   s += ",\"count\":";
   s += std::to_string(g_inject_count);
   s += ",\"safe_mode\":";
@@ -1618,6 +1637,7 @@ void handle_client(int client) {
     if (peer_can_query_status(client, &cr)) {
       read_yzconfig();
       rescan_modules();
+      (void)yzpolicy::refresh(true);
       ok = 1;
     } else {
       DLOGI("Reload denied: peer uid=%d manager uid=%d",
@@ -1876,8 +1896,11 @@ void nl_drain(int fd) {
     } else if (ev->type == YZ_EV_RELOAD) {
       rescan_modules();
       read_yzconfig();
+      (void)yzpolicy::refresh(true);
     } else if (ev->type == YZ_EV_SAFEMODE) {
       note_safemode_event(ev->pid, ev->appid);
+    } else if (ev->type == YZ_EV_POLICY_REFRESH) {
+      yzpolicy::handle_refresh_request(ev->appid);
     }
   }
 }
@@ -1987,16 +2010,26 @@ int run_daemon(int argc, char **argv) {
     return 1;
   }
 
+  int nlfd = nl_listen();
+  yz_root_status_cmd root_status{};
+  bool policy_ready = false;
+  if (yzhost::get_root_status(&root_status)) {
+    policy_ready =
+        yzpolicy::setup(yzhost::g_control_fd, root_status);
+  } else {
+    DLOGE("failed to read root policy status");
+  }
+
   rescan_modules();
   read_yzconfig();
   refresh_safemode_status();
   bool offsets_ready = send_dlopen_offset();
 
-  int nlfd = nl_listen();
-  DLOGI("zygiskd up: unix @%s, netlink proto=%d, modules=%s, config=%s",
+  DLOGI("zygiskd up: unix @%s, netlink proto=%d, modules=%s, config=%s, policy=%s ready=%u",
         zygiskd::kSocketName, YZ_NETLINK_PROTO,
-        yzhost::modules_dir().c_str(), yzhost::config_path().c_str());
-  notify_ready(ready_fd, offsets_ready);
+        yzhost::modules_dir().c_str(), yzhost::config_path().c_str(),
+        yzpolicy::source_name(), policy_ready ? 1 : 0);
+  notify_ready(ready_fd, offsets_ready && policy_ready);
 
   pollfd pfds[2] = {{srv, POLLIN, 0}, {nlfd, POLLIN, 0}};
   nfds_t nfds = (nlfd >= 0) ? 2 : 1;

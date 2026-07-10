@@ -22,6 +22,7 @@
 #include "feature/zygote_orch.h"
 #include "feature/zygote_probe.h"
 #include "host/host.h"
+#include "uapi/yukizygisk.h"
 
 static unsigned int yz_init_stage_mask = 0x3f;
 module_param_named(init_stage_mask, yz_init_stage_mask, uint, 0644);
@@ -121,6 +122,13 @@ static int __init yukizygisk_init(void)
 		pr_info("yukizygisk: init step zygote_nl\n");
 		yz_zygote_nl_init();
 		yz_stage_nl_active = true;
+		if (yz_host_policy_uses_fallback()) {
+			struct yz_host_root_status status = { 0 };
+
+			yz_host_get_root_status(&status);
+			yz_zygote_nl_emit_policy_refresh(
+				status.owner, YZ_POLICY_REFRESH_ALL);
+		}
 		pr_info("yukizygisk: init step zygote_nl done\n");
 	} else {
 		pr_info("yukizygisk: init step zygote_nl skipped\n");

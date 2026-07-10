@@ -17,5 +17,6 @@ void yz_zygote_nl_exit(void);
 void yz_zygote_nl_emit_specialize(u32 pid, u32 appid);
 void yz_zygote_nl_emit_reload(void);
 void yz_zygote_nl_emit_safemode(u32 pid, u32 crashes);
+void yz_zygote_nl_emit_policy_refresh(u32 owner, u32 uid);
 
 #endif // #ifndef __YZ_H_ZYGOTE_NL

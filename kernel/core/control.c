@@ -33,6 +33,10 @@
 
 #define YZ_PER_USER_RANGE 100000
 
+#ifndef fd_file
+#define fd_file(fd) ((fd).file)
+#endif
+
 static bool yz_is_appuid(uid_t uid)
 {
 	return uid % YZ_PER_USER_RANGE >= 10000;
@@ -102,6 +106,10 @@ static int yz_ioctl_get_root_status(void __user *arg)
 	cmd.owner = status.owner;
 	cmd.mask = status.mask;
 	cmd.flags = status.flags;
+	if (yz_host_policy_uses_fallback() &&
+	    !yz_host_policy_cache_ready())
+		yz_zygote_nl_emit_policy_refresh(
+			status.owner, YZ_POLICY_REFRESH_ALL);
 
 	if (copy_to_user(arg, &cmd, sizeof(cmd)))
 		return -EFAULT;
@@ -111,13 +119,45 @@ static int yz_ioctl_get_root_status(void __user *arg)
 static int yz_ioctl_uid_should_umount(void __user *arg)
 {
 	struct yz_uid_policy_cmd cmd;
+	bool should_umount;
+	int ret;
 
 	if (copy_from_user(&cmd, arg, sizeof(cmd)))
 		return -EFAULT;
-	cmd.should_umount = yz_host_uid_should_umount((uid_t)cmd.uid) ? 1 : 0;
+	ret = yz_host_uid_should_umount((uid_t)cmd.uid, &should_umount);
+	if (ret) {
+		if (ret == -EAGAIN) {
+			struct yz_host_root_status status = { 0 };
+
+			yz_host_get_root_status(&status);
+			yz_zygote_nl_emit_policy_refresh(
+				status.owner, cmd.uid);
+		}
+		return ret;
+	}
+	cmd.should_umount = should_umount ? 1 : 0;
 	if (copy_to_user(arg, &cmd, sizeof(cmd)))
 		return -EFAULT;
 	return 0;
+}
+
+static int yz_ioctl_set_policy_cache(void __user *arg)
+{
+	struct yz_policy_cache_cmd cmd;
+	struct fd fd;
+	int ret;
+
+	if (copy_from_user(&cmd, arg, sizeof(cmd)))
+		return -EFAULT;
+	if (cmd.fd < 0 || cmd.reserved != 0)
+		return -EINVAL;
+
+	fd = fdget(cmd.fd);
+	if (!fd_file(fd))
+		return -EBADF;
+	ret = yz_host_install_policy_cache(fd_file(fd));
+	fdput(fd);
+	return ret;
 }
 
 static int yz_ioctl_umount_pid(void __user *arg)
@@ -327,6 +367,8 @@ static long yukizygisk_ioctl(struct file *file, unsigned int request,
 		return yz_ioctl_get_root_status(uarg);
 	case YZ_IOCTL_UID_SHOULD_UMOUNT:
 		return yz_ioctl_uid_should_umount(uarg);
+	case YZ_IOCTL_SET_POLICY_CACHE:
+		return yz_ioctl_set_policy_cache(uarg);
 	default:
 		return -ENOTTY;
 	}

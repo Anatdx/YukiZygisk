@@ -12,6 +12,8 @@
 
 #include <linux/types.h>
 
+struct file;
+
 enum yz_root_impl_type {
 	YZ_ROOT_NONE = 0,
 	YZ_ROOT_KSU = 1 << 0,
@@ -65,7 +67,10 @@ extern int (*yz_ap_list_kstorage_ids)(int gid, long *ids, int idslen,
 int yz_host_root_detect(void);
 void yz_host_root_exit(void);
 bool yz_host_root_allows_policy(void);
-bool yz_host_uid_should_umount(uid_t uid);
+bool yz_host_policy_uses_fallback(void);
+bool yz_host_policy_cache_ready(void);
+int yz_host_uid_should_umount(uid_t uid, bool *should_umount);
+int yz_host_install_policy_cache(struct file *file);
 const char *yz_host_root_name(void);
 u32 yz_host_root_flags(void);
 

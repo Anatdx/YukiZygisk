@@ -24,7 +24,10 @@ enum yz_event_type {
 	YZ_EV_SPECIALIZE = 1,
 	YZ_EV_RELOAD = 2,
 	YZ_EV_SAFEMODE = 3,
+	YZ_EV_POLICY_REFRESH = 4,
 };
+
+#define YZ_POLICY_REFRESH_ALL ((__u32)~0U)
 
 struct yz_event {
 	__u32 type;
@@ -190,6 +193,9 @@ enum yz_root_owner_uapi {
 };
 
 #define YZ_ROOT_STATUS_KSU_REDIRECT (1U << 0)
+#define YZ_ROOT_STATUS_POLICY_KERNEL (1U << 1)
+#define YZ_ROOT_STATUS_POLICY_FALLBACK (1U << 2)
+#define YZ_ROOT_STATUS_POLICY_CACHE_READY (1U << 3)
 
 struct yz_root_status_cmd {
 	__u32 owner;
@@ -204,6 +210,37 @@ struct yz_root_status_cmd {
 struct yz_uid_policy_cmd {
 	__u32 uid;
 	__u32 should_umount;
+};
+
+#define YZ_POLICY_CACHE_MAGIC 0x43505a59U /* YZPC */
+#define YZ_POLICY_CACHE_VERSION 1U
+#define YZ_POLICY_CACHE_MAX_ENTRIES 8192U
+#define YZ_POLICY_CACHE_F_COMPLETE (1U << 0)
+
+struct yz_policy_cache_header {
+	__u32 magic;
+	__u16 version;
+	__u16 header_size;
+	__u16 entry_size;
+	__u16 flags;
+	__u32 owner;
+	__u32 generation;
+	__u32 count;
+	__u32 default_should_umount;
+	__u32 manager_appid;
+};
+
+struct yz_policy_cache_entry {
+	__u32 uid;
+	__u32 should_umount;
+};
+
+#define YZ_IOCTL_SET_POLICY_CACHE                                  \
+	_IOC(_IOC_WRITE, YZ_IOCTL_MAGIC, 63, 0)
+
+struct yz_policy_cache_cmd {
+	__s32 fd;
+	__u32 reserved;
 };
 
 struct yz_config {
