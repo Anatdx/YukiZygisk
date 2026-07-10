@@ -309,65 +309,63 @@ static int yz_lsm_hook_apply(struct yz_host_lsm_hook *hook)
 		unsigned long heads_size = sizeof(struct security_hook_heads);
 		struct hlist_head *head_end;
 
-		if (!yz_lookup_size_offset(heads_addr, &heads_size, NULL))
-			pr_warn("yukizygisk: lsm_hook failed to get heads size\n");
-
 		head = (struct hlist_head *)heads_addr;
 		head_end = (struct hlist_head *)(heads_addr + heads_size);
+		head = (struct hlist_head *)(heads_addr + hook->head_offset);
+		if (head < (struct hlist_head *)heads_addr || head >= head_end) {
+			pr_err("yukizygisk: lsm_hook head %s offset out of range\n",
+			       hook->head_name ?: "unknown");
+			ret = -EINVAL;
+			goto out_unlock;
+		}
 
-		for (; head < head_end; head++) {
-			hlist_for_each_entry(entry, head, list) {
-				void **slot = (void **)((char *)entry +
-							hook->hook_offset);
-				void *current_origin = READ_ONCE(*slot);
-				int j;
+		hlist_for_each_entry(entry, head, list) {
+			void **slot = (void **)((char *)entry +
+						hook->hook_offset);
+			void *current_origin = READ_ONCE(*slot);
+			int j;
 
-				for (j = 0; j < yz_lsm_hook_count; j++) {
-					if (yz_lsm_hook_entries[j]
-						    .hook->replacement ==
-					    current_origin) {
-						current_origin =
-							yz_lsm_hook_entries[j]
-								.hook->original;
-						break;
-					}
-				}
-
-				if (current_origin == hook->replacement) {
-					ret = -EALREADY;
-					goto out_unlock;
-				}
-				if (current_origin == target) {
-					selected_entry = entry;
-					selected_slot = slot;
-					selected_origin = current_origin;
+			for (j = 0; j < yz_lsm_hook_count; j++) {
+				if (yz_lsm_hook_entries[j].hook->replacement ==
+				    current_origin) {
+					current_origin =
+						yz_lsm_hook_entries[j]
+							.hook->original;
 					break;
 				}
 			}
-			if (selected_entry) {
-				if (hook->offset) {
-					head += hook->offset;
-					if (head < (struct hlist_head *)heads_addr ||
-					    head >= head_end) {
-						ret = -EINVAL;
-						goto out_unlock;
-					}
 
-					if (!head->first) {
-						ret = -ENOENT;
-						goto out_unlock;
-					}
-
-					selected_entry = hlist_entry(
-						head->first,
-						struct security_hook_list, list);
-					selected_slot = (void **)((char *)
-								  selected_entry +
-							  hook->hook_offset);
-					selected_origin = *selected_slot;
-				}
+			if (current_origin == hook->replacement) {
+				ret = -EALREADY;
+				goto out_unlock;
+			}
+			if (current_origin == target) {
+				selected_entry = entry;
+				selected_slot = slot;
+				selected_origin = current_origin;
 				break;
 			}
+		}
+
+		if (selected_entry && hook->offset) {
+			head += hook->offset;
+			if (head < (struct hlist_head *)heads_addr ||
+			    head >= head_end) {
+				ret = -EINVAL;
+				goto out_unlock;
+			}
+
+			if (!head->first) {
+				ret = -ENOENT;
+				goto out_unlock;
+			}
+
+			selected_entry = hlist_entry(head->first,
+						    struct security_hook_list,
+						    list);
+			selected_slot = (void **)((char *)selected_entry +
+						  hook->hook_offset);
+			selected_origin = *selected_slot;
 		}
 	}
 

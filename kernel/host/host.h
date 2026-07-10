@@ -15,20 +15,7 @@
 
 #include "host/lsm.h"
 
-#define YZ_FEATURE_YUKIZYGISK 1
-#define YZ_FEATURE_MAX 32
-
 struct file;
-
-typedef int (*yz_host_feature_get_t)(u64 *value);
-typedef int (*yz_host_feature_set_t)(u64 value);
-
-struct yz_host_feature_handler {
-	u32 feature_id;
-	const char *name;
-	yz_host_feature_get_t get_handler;
-	yz_host_feature_set_t set_handler;
-};
 
 struct yz_file_load_policy {
 	u32 src_type;
@@ -44,12 +31,6 @@ struct yz_file_load_policy {
 
 int yz_host_init(void);
 void yz_host_exit(void);
-
-int yz_host_register_feature_handler(
-	const struct yz_host_feature_handler *handler);
-int yz_host_unregister_feature_handler(u32 feature_id);
-int yz_host_get_feature(u32 feature_id, u64 *value, bool *supported);
-int yz_host_set_feature(u32 feature_id, u64 value);
 
 const struct cred *yz_host_override_creds(void);
 void yz_host_revert_creds(const struct cred *old_cred);

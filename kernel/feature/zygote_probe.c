@@ -32,6 +32,7 @@
 #include <linux/file.h>
 #include <linux/jiffies.h>
 #include <linux/list.h>
+#include <linux/moduleparam.h>
 #include <linux/mutex.h>
 #include <linux/proc_fs.h>
 #include <linux/random.h>
@@ -44,12 +45,11 @@
 #include "zygote_probe.h"
 #include "zygote_nl.h"
 #include "host/host.h"
+#include "host/runtime.h"
 #include "klog.h" // IWYU pragma: keep
 #include "uapi/yukizygisk.h"
 
 static const char app_process[] = "app_process";
-
-static bool yukizygisk_enabled;
 
 struct zp_zygote_guard {
 	char name[YZ_ZYGOTE_NAME_MAX];
@@ -65,6 +65,10 @@ static u32 zp_safemode_zygote_crashes;
 static char zp_safemode_zygote[YZ_ZYGOTE_NAME_MAX];
 
 #define ZP_ENABLE_LSM_INJECTOR 1
+
+static bool zp_enable_lsm_injector = true;
+module_param_named(probe_lsm, zp_enable_lsm_injector, bool, 0644);
+MODULE_PARM_DESC(probe_lsm, "Enable the zygote bprm LSM injector");
 
 #define ZP_STUB_EXTINFO_OFF 0xa00
 #define ZP_STUB_STR_OFF 0xc00
@@ -315,27 +319,6 @@ static struct yz_host_lsm_hook zygote_probe_hook = YZ_HOST_LSM_HOOK_INIT(
 	bprm_committed_creds, ZP_BPRM_HOOK_TARGET, my_bprm_committed_creds, 0);
 
 typedef void (*bprm_committed_creds_fn)(zp_bprm_arg_t *bprm);
-
-static int yukizygisk_feature_get(u64 *value)
-{
-	*value = READ_ONCE(yukizygisk_enabled) ? 1 : 0;
-	return 0;
-}
-
-static int yukizygisk_feature_set(u64 value)
-{
-	WRITE_ONCE(yukizygisk_enabled, value != 0);
-	pr_info("zygote_probe: YukiZygisk %s\n",
-		yukizygisk_enabled ? "ENABLED" : "disabled");
-	return 0;
-}
-
-static const struct yz_host_feature_handler yukizygisk_feature_handler = {
-	.feature_id = YZ_FEATURE_YUKIZYGISK,
-	.name = "yukizygisk",
-	.get_handler = yukizygisk_feature_get,
-	.set_handler = yukizygisk_feature_set,
-};
 
 static bool zp_is_app_process_path(const char *filename)
 {
@@ -622,9 +605,9 @@ static struct file *zp_open_first(const char *primary, const char *fallback,
 	const struct cred *old_cred;
 
 	old_cred = yz_host_override_creds();
-	file = filp_open(primary, O_RDONLY, 0);
+	file = yz_file_open(primary, O_RDONLY, 0);
 	if (IS_ERR(file)) {
-		file = filp_open(fallback, O_RDONLY, 0);
+		file = yz_file_open(fallback, O_RDONLY, 0);
 		if (!IS_ERR(file) && chosen_path)
 			*chosen_path = fallback;
 	} else if (chosen_path) {
@@ -637,7 +620,7 @@ static struct file *zp_open_first(const char *primary, const char *fallback,
 static bool zp_read_exact_file(struct file *file, void *buf, size_t size,
 			       loff_t *pos)
 {
-	ssize_t got = kernel_read(file, buf, size, pos);
+	ssize_t got = yz_kernel_read(file, buf, size, pos);
 
 	return got == (ssize_t)size;
 }
@@ -663,7 +646,7 @@ zp_check_file_size(const char *path, u64 want_size, u64 *actual, long *open_err)
 		return ZP_FILE_SIZE_MISMATCH;
 
 	old_cred = yz_host_override_creds();
-	file = filp_open(path, O_RDONLY, 0);
+	file = yz_file_open(path, O_RDONLY, 0);
 	yz_host_revert_creds(old_cred);
 	if (IS_ERR(file)) {
 		if (open_err)
@@ -672,7 +655,7 @@ zp_check_file_size(const char *path, u64 want_size, u64 *actual, long *open_err)
 	}
 
 	size = i_size_read(file_inode(file));
-	filp_close(file, NULL);
+	yz_file_close(file, NULL);
 	if (actual)
 		*actual = size;
 	return size == want_size ? ZP_FILE_SIZE_MATCH : ZP_FILE_SIZE_MISMATCH;
@@ -791,18 +774,7 @@ static void zp_load_early_native_locked(void)
 			path ?: "(unknown)", zp_early_native_count,
 			zp_early_dlopen_off, zp_early_dlsym_off);
 out:
-	filp_close(file, NULL);
-}
-
-static bool zp_early_native_active(void)
-{
-	bool active;
-
-	mutex_lock(&zp_early_native_lock);
-	zp_load_early_native_locked();
-	active = zp_early_native_enabled;
-	mutex_unlock(&zp_early_native_lock);
-	return active;
+	yz_file_close(file, NULL);
 }
 
 static bool zp_match_early_native_target(const char *filename, char *label,
@@ -863,11 +835,7 @@ static const char *zp_early_native_core_path(void)
 
 static void zp_close_current_fd(int fd)
 {
-#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 11, 0)
-	ksys_close(fd);
-#else
-	close_fd(fd);
-#endif // #if LINUX_VERSION_CODE < KERNEL_VERSION...
+	yz_close_fd((unsigned int)fd);
 }
 
 static void zp_cache_name(char *buf, size_t len)
@@ -895,7 +863,7 @@ static int zp_stage_fd(const char *path, const char *name,
 	/* Read payload with the host-provided privileged credential. */
 	old_cred = yz_host_override_creds();
 
-	src = filp_open(path, O_RDONLY, 0);
+	src = yz_file_open(path, O_RDONLY, 0);
 	if (IS_ERR(src)) {
 		yz_host_revert_creds(old_cred);
 		pr_info("zygote_probe: [2c-3b] open %s failed: %ld\n", path,
@@ -903,26 +871,26 @@ static int zp_stage_fd(const char *path, const char *name,
 		return -ENOENT;
 	}
 	if (!S_ISREG(file_inode(src)->i_mode)) {
-		filp_close(src, NULL);
+		yz_file_close(src, NULL);
 		yz_host_revert_creds(old_cred);
 		return -EINVAL;
 	}
 
 	sz = i_size_read(file_inode(src));
 	if (sz <= 0 || sz > ZP_LOADER_MAX_SZ) {
-		filp_close(src, NULL);
+		yz_file_close(src, NULL);
 		yz_host_revert_creds(old_cred);
 		return -EINVAL;
 	}
 
 	buf = kvmalloc(sz, GFP_KERNEL);
 	if (!buf) {
-		filp_close(src, NULL);
+		yz_file_close(src, NULL);
 		yz_host_revert_creds(old_cred);
 		return -ENOMEM;
 	}
 	pos = 0;
-	r = kernel_read(src, buf, sz, &pos);
+	r = yz_kernel_read(src, buf, sz, &pos);
 
 	yz_host_revert_creds(old_cred);
 	old_cred = NULL;
@@ -930,7 +898,7 @@ static int zp_stage_fd(const char *path, const char *name,
 	if (r != sz) {
 		pr_info("zygote_probe: [2c-3b] read %s short: %zd/%lld\n", path,
 			r, (long long)sz);
-		filp_close(src, NULL);
+		yz_file_close(src, NULL);
 		kvfree(buf);
 		return r < 0 ? (int)r : -EIO;
 	}
@@ -943,7 +911,7 @@ static int zp_stage_fd(const char *path, const char *name,
 				"failed: %d\n",
 				path, ret);
 	}
-	filp_close(src, NULL);
+	yz_file_close(src, NULL);
 
 	mfd = shmem_file_setup(name, sz, 0);
 	if (IS_ERR(mfd)) {
@@ -959,7 +927,7 @@ static int zp_stage_fd(const char *path, const char *name,
 	/* shmem_file_setup lacks FMODE_PREAD/PWRITE by default. */
 	mfd->f_mode |= FMODE_PREAD | FMODE_PWRITE | FMODE_LSEEK;
 	pos = 0;
-	r = kernel_write(mfd, buf, sz, &pos);
+	r = yz_kernel_write(mfd, buf, sz, &pos);
 	kvfree(buf);
 	if (r != sz) {
 		pr_info("zygote_probe: [2c-3b] write staged %s short: "
@@ -996,7 +964,7 @@ static int zp_stage_file_fd(const char *path,
 	int ret;
 
 	old_cred = yz_host_override_creds();
-	file = filp_open(path, O_RDONLY, 0);
+	file = yz_file_open(path, O_RDONLY, 0);
 	yz_host_revert_creds(old_cred);
 	if (IS_ERR(file)) {
 		pr_info("zygote_probe: [2c-3b] open real %s failed: %ld\n",
@@ -1004,13 +972,13 @@ static int zp_stage_file_fd(const char *path,
 		return PTR_ERR(file);
 	}
 	if (!S_ISREG(file_inode(file)->i_mode)) {
-		filp_close(file, NULL);
+		yz_file_close(file, NULL);
 		return -EINVAL;
 	}
 
 	sz = i_size_read(file_inode(file));
 	if (sz <= 0 || sz > ZP_LOADER_MAX_SZ) {
-		filp_close(file, NULL);
+		yz_file_close(file, NULL);
 		return -EINVAL;
 	}
 
@@ -1026,7 +994,7 @@ static int zp_stage_file_fd(const char *path,
 	if (fd < 0) {
 		if (policy_state)
 			zp_restore_native_policy_state(policy_state);
-		filp_close(file, NULL);
+		yz_file_close(file, NULL);
 		return fd;
 	}
 	fd_install(fd, file);
@@ -1081,7 +1049,7 @@ static int zp_install_packet_fd(const void *buf, size_t size)
 	if (IS_ERR(mfd))
 		return PTR_ERR(mfd);
 	mfd->f_mode |= FMODE_PREAD | FMODE_PWRITE | FMODE_LSEEK;
-	w = kernel_write(mfd, buf, size, &pos);
+	w = yz_kernel_write(mfd, buf, size, &pos);
 	if (w != (ssize_t)size) {
 		fput(mfd);
 		return w < 0 ? (int)w : -EIO;
@@ -1326,8 +1294,7 @@ static void zp_inject_tw_func(struct callback_head *cb)
 	}
 
 	/* Redirect only after the stub is staged. */
-	if ((yukizygisk_enabled || (native && tw->early_native)) &&
-	    at_entry_uaddr && at_entry_uval == saved && saved) {
+	if (at_entry_uaddr && at_entry_uval == saved && saved) {
 #ifdef CONFIG_ARM64
 		/* AArch64 AT_ENTRY stub. */
 		static const u32 tmpl[] = {
@@ -1545,22 +1512,16 @@ static void __nocfi my_bprm_committed_creds(zp_bprm_arg_t *bprm)
 	char native_label[64] = {};
 	u8 native_target_type = 0;
 	bool early_native = false;
-	bool live_enabled;
-	bool early_enabled;
 	bool by_sid;
 	bool by_path;
 	bool by_native;
 
 	((bprm_committed_creds_fn)zygote_probe_hook.original)(bprm);
-	live_enabled = READ_ONCE(yukizygisk_enabled);
-	early_enabled = zp_early_native_active();
-	if (unlikely(!live_enabled && !early_enabled))
-		return;
 	if (unlikely(zp_safemode_is_active()))
 		return;
 
-	by_sid = live_enabled && yz_host_is_zygote(current_cred());
-	by_path = live_enabled && zp_is_app_process_path(filename);
+	by_sid = yz_host_is_zygote(current_cred());
+	by_path = zp_is_app_process_path(filename);
 	by_native =
 	    !by_path &&
 	    zp_match_native_target(filename, native_label, sizeof(native_label),
@@ -1595,7 +1556,8 @@ static void __nocfi my_bprm_committed_creds(zp_bprm_arg_t *bprm)
 						     native_label);
 				}
 				init_task_work(&tw->cb, zp_inject_tw_func);
-				if (task_work_add(current, &tw->cb, TWA_RESUME))
+				if (yz_task_work_add(current, &tw->cb,
+						     TWA_RESUME))
 					kfree(tw);
 			}
 		}
@@ -1605,7 +1567,14 @@ static void __nocfi my_bprm_committed_creds(zp_bprm_arg_t *bprm)
 void yz_zygote_probe_init(void)
 {
 #if ZP_ENABLE_LSM_INJECTOR
-	int ret = yz_host_register_lsm_hook(&zygote_probe_hook);
+	int ret;
+
+	if (!zp_enable_lsm_injector) {
+		pr_info("zygote_probe: LSM injector disabled by module parameter\n");
+		return;
+	}
+
+	ret = yz_host_register_lsm_hook(&zygote_probe_hook);
 
 	if (ret)
 		pr_err("zygote_probe: failed to register bprm hook: %d\n", ret);
@@ -1617,18 +1586,12 @@ void yz_zygote_probe_init(void)
 #else
 	pr_info("zygote_probe: LSM injector disabled for bootloop isolation\n");
 #endif // #if ZP_ENABLE_LSM_INJECTOR
-
-	if (yz_host_register_feature_handler(&yukizygisk_feature_handler))
-		pr_err("zygote_probe: failed to register YukiZygisk feature\n");
-	else
-		pr_info("zygote_probe: feature registered\n");
 }
 
 void yz_zygote_probe_exit(void)
 {
-	yz_host_unregister_feature_handler(YZ_FEATURE_YUKIZYGISK);
-	WRITE_ONCE(yukizygisk_enabled, false);
 #if ZP_ENABLE_LSM_INJECTOR
-	yz_host_unregister_lsm_hook(&zygote_probe_hook);
+	if (zp_enable_lsm_injector)
+		yz_host_unregister_lsm_hook(&zygote_probe_hook);
 #endif // #if ZP_ENABLE_LSM_INJECTOR
 }

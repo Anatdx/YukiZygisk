@@ -71,7 +71,7 @@ static int yz_try_umount(const char *mnt, int flags)
 	if (ret)
 		return ret;
 
-	ret = kern_path(mnt, 0, &path);
+	ret = yz_kern_path(mnt, 0, &path);
 	if (ret)
 		return ret;
 
@@ -163,15 +163,16 @@ static int yz_umount_scan_mountinfo(void)
 		return -ENOMEM;
 	}
 
-	file = filp_open("/proc/self/mountinfo", O_RDONLY, 0);
+	file = yz_file_open("/proc/self/mountinfo", O_RDONLY, 0);
 	if (IS_ERR(file)) {
 		ret = PTR_ERR(file);
 		goto out_free;
 	}
 
 	while (total < YZ_MOUNTINFO_BUF - 1) {
-		ssize_t n = kernel_read(file, buf + total,
-					YZ_MOUNTINFO_BUF - 1 - total, &pos);
+		ssize_t n = yz_kernel_read(file, buf + total,
+					   YZ_MOUNTINFO_BUF - 1 - total,
+					   &pos);
 
 		if (n < 0) {
 			ret = n;
@@ -181,7 +182,7 @@ static int yz_umount_scan_mountinfo(void)
 			break;
 		total += n;
 	}
-	filp_close(file, NULL);
+	yz_file_close(file, NULL);
 	if (ret)
 		goto out_free;
 
@@ -270,7 +271,7 @@ int yz_host_umount_pid(pid_t pid)
 	}
 
 	init_task_work(&tw->cb, yz_umount_tw_func);
-	ret = task_work_add(task, &tw->cb, TWA_RESUME);
+	ret = yz_task_work_add(task, &tw->cb, TWA_RESUME);
 	if (ret) {
 		kfree(tw);
 		put_task_struct(task);

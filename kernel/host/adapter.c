@@ -11,7 +11,6 @@
 #include <linux/cred.h>
 #include <linux/errno.h>
 #include <linux/file.h>
-#include <linux/mutex.h>
 #include <linux/printk.h>
 #include <linux/string.h>
 
@@ -20,30 +19,38 @@
 #include "host/root_impl.h"
 #include "host/runtime.h"
 
-static DEFINE_MUTEX(yz_feature_lock);
-static const struct yz_host_feature_handler
-	*yz_feature_handlers[YZ_FEATURE_MAX + 1];
 static struct cred *yz_priv_cred;
 
 int yz_host_init(void)
 {
 	int ret;
 
+	pr_info("yukizygisk: host step runtime\n");
 	ret = yz_host_runtime_init();
-	if (ret)
+	if (ret) {
+		pr_err("yukizygisk: host runtime init failed: %d\n", ret);
 		return ret;
+	}
+	pr_info("yukizygisk: host step runtime done\n");
+
+	pr_info("yukizygisk: host step policy\n");
 	ret = yz_host_policy_init();
 	if (ret) {
+		pr_err("yukizygisk: host policy init failed: %d\n", ret);
 		yz_host_runtime_exit();
 		return ret;
 	}
+	pr_info("yukizygisk: host step policy done\n");
 
-	yz_priv_cred = prepare_creds();
+	pr_info("yukizygisk: host step privileged creds\n");
+	yz_priv_cred = yz_prepare_creds();
 	if (!yz_priv_cred) {
+		pr_err("yukizygisk: prepare privileged creds failed\n");
 		yz_host_policy_exit();
 		yz_host_runtime_exit();
 		return -ENOMEM;
 	}
+	pr_info("yukizygisk: host step privileged creds done\n");
 
 	pr_info("yukizygisk: host roots mask=0x%x policy=%s\n", yz_root_mask,
 		yz_host_root_allows_policy() ? "available" : "unavailable");
@@ -53,94 +60,22 @@ int yz_host_init(void)
 void yz_host_exit(void)
 {
 	if (yz_priv_cred) {
-		abort_creds(yz_priv_cred);
+		yz_abort_creds(yz_priv_cred);
 		yz_priv_cred = NULL;
 	}
 	yz_host_policy_exit();
 	yz_host_runtime_exit();
 }
 
-int yz_host_register_feature_handler(
-	const struct yz_host_feature_handler *handler)
-{
-	if (!handler || handler->feature_id > YZ_FEATURE_MAX)
-		return -EINVAL;
-
-	mutex_lock(&yz_feature_lock);
-	if (yz_feature_handlers[handler->feature_id]) {
-		mutex_unlock(&yz_feature_lock);
-		return -EEXIST;
-	}
-	yz_feature_handlers[handler->feature_id] = handler;
-	mutex_unlock(&yz_feature_lock);
-
-	pr_info("yukizygisk: feature registered id=%u name=%s\n",
-		handler->feature_id, handler->name ?: "(null)");
-	return 0;
-}
-
-int yz_host_unregister_feature_handler(u32 feature_id)
-{
-	if (feature_id > YZ_FEATURE_MAX)
-		return -EINVAL;
-
-	mutex_lock(&yz_feature_lock);
-	yz_feature_handlers[feature_id] = NULL;
-	mutex_unlock(&yz_feature_lock);
-	return 0;
-}
-
-int yz_host_get_feature(u32 feature_id, u64 *value, bool *supported)
-{
-	const struct yz_host_feature_handler *handler;
-	int ret = 0;
-
-	if (value)
-		*value = 0;
-	if (supported)
-		*supported = false;
-	if (feature_id > YZ_FEATURE_MAX)
-		return -EINVAL;
-
-	mutex_lock(&yz_feature_lock);
-	handler = yz_feature_handlers[feature_id];
-	if (handler && handler->get_handler) {
-		if (supported)
-			*supported = true;
-		ret = handler->get_handler(value);
-	}
-	mutex_unlock(&yz_feature_lock);
-	return handler ? ret : -ENOENT;
-}
-
-int yz_host_set_feature(u32 feature_id, u64 value)
-{
-	const struct yz_host_feature_handler *handler;
-	int ret;
-
-	if (feature_id > YZ_FEATURE_MAX)
-		return -EINVAL;
-
-	mutex_lock(&yz_feature_lock);
-	handler = yz_feature_handlers[feature_id];
-	if (!handler || !handler->set_handler) {
-		mutex_unlock(&yz_feature_lock);
-		return -ENOENT;
-	}
-	ret = handler->set_handler(value);
-	mutex_unlock(&yz_feature_lock);
-	return ret;
-}
-
 const struct cred *yz_host_override_creds(void)
 {
-	return yz_priv_cred ? override_creds(yz_priv_cred) : NULL;
+	return yz_priv_cred ? yz_override_creds(yz_priv_cred) : NULL;
 }
 
 void yz_host_revert_creds(const struct cred *old_cred)
 {
 	if (old_cred)
-		revert_creds(old_cred);
+		yz_revert_creds(old_cred);
 }
 
 bool yz_host_is_zygote(const struct cred *cred)

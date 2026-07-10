@@ -15,6 +15,7 @@
 #include <linux/rcupdate.h>
 #include <linux/sched.h>
 #include <linux/spinlock.h>
+#include <linux/string.h>
 #include <linux/tracepoint.h>
 #include <linux/types.h>
 #include <linux/uidgid.h>
@@ -49,6 +50,9 @@ struct zo_child {
 static struct zo_child zo_children[ZO_MAX_CHILDREN];
 static DEFINE_SPINLOCK(zo_lock);
 static bool zo_trace_sys_exit_registered;
+static struct tracepoint *zo_trace_sys_exit_tp;
+static struct tracepoint *zo_trace_fork_tp;
+static struct tracepoint *zo_trace_free_tp;
 
 struct zo_specialize_event {
 	pid_t pid;
@@ -181,6 +185,59 @@ static void zo_specialize_events_reset(void)
 	spin_unlock_irqrestore(&zo_event_lock, flags);
 }
 
+struct zo_tracepoint_lookup {
+	const char *name;
+	struct tracepoint *tp;
+};
+
+static void zo_tracepoint_find(struct tracepoint *tp, void *priv)
+{
+	struct zo_tracepoint_lookup *lookup = priv;
+
+	if (!lookup->tp && tp->name && !strcmp(tp->name, lookup->name))
+		lookup->tp = tp;
+}
+
+static struct tracepoint *zo_lookup_tracepoint(const char *name)
+{
+	struct zo_tracepoint_lookup lookup = {
+		.name = name,
+	};
+
+	for_each_kernel_tracepoint(zo_tracepoint_find, &lookup);
+	return lookup.tp;
+}
+
+static int zo_register_tracepoint(struct tracepoint **slot, const char *name,
+				  void *probe)
+{
+	struct tracepoint *tp;
+	int ret;
+
+	if (*slot)
+		return -EALREADY;
+
+	tp = zo_lookup_tracepoint(name);
+	if (!tp)
+		return -ENOENT;
+
+	ret = tracepoint_probe_register(tp, probe, NULL);
+	if (ret)
+		return ret;
+
+	*slot = tp;
+	return 0;
+}
+
+static void zo_unregister_tracepoint(struct tracepoint **slot, void *probe)
+{
+	if (!*slot)
+		return;
+
+	tracepoint_probe_unregister(*slot, probe, NULL);
+	*slot = NULL;
+}
+
 #ifdef CONFIG_HAVE_SYSCALL_TRACEPOINTS
 static void zo_on_sys_exit(void *data, struct pt_regs *regs, long ret)
 {
@@ -206,7 +263,8 @@ static int zo_tracepoint_init(void)
 {
 	int ret;
 
-	ret = register_trace_sys_exit(zo_on_sys_exit, NULL);
+	ret = zo_register_tracepoint(&zo_trace_sys_exit_tp, "sys_exit",
+				     (void *)zo_on_sys_exit);
 	if (ret)
 		return ret;
 	zo_trace_sys_exit_registered = true;
@@ -218,7 +276,8 @@ static void zo_tracepoint_exit(void)
 {
 	if (!zo_trace_sys_exit_registered)
 		return;
-	unregister_trace_sys_exit(zo_on_sys_exit, NULL);
+	zo_unregister_tracepoint(&zo_trace_sys_exit_tp,
+				 (void *)zo_on_sys_exit);
 	tracepoint_synchronize_unregister();
 	zo_trace_sys_exit_registered = false;
 }
@@ -308,17 +367,22 @@ static void zo_on_free(void *data, struct task_struct *p)
 
 void yz_zygote_orch_init(void)
 {
-	int ret = register_trace_sched_process_fork(zo_on_fork, NULL);
+	int ret = zo_register_tracepoint(&zo_trace_fork_tp,
+					 "sched_process_fork",
+					 (void *)zo_on_fork);
 
 	if (ret) {
 		pr_err("zygote_orch: register fork probe failed: %d\n", ret);
 		return;
 	}
 
-	ret = register_trace_sched_process_free(zo_on_free, NULL);
+	ret = zo_register_tracepoint(&zo_trace_free_tp,
+				     "sched_process_free",
+				     (void *)zo_on_free);
 	if (ret) {
 		pr_err("zygote_orch: register free probe failed: %d\n", ret);
-		unregister_trace_sched_process_fork(zo_on_fork, NULL);
+		zo_unregister_tracepoint(&zo_trace_fork_tp,
+					 (void *)zo_on_fork);
 		tracepoint_synchronize_unregister();
 		return;
 	}
@@ -331,8 +395,8 @@ void yz_zygote_orch_exit(void)
 {
 	zo_setresuid_monitor_exit();
 	zo_specialize_events_reset();
-	unregister_trace_sched_process_fork(zo_on_fork, NULL);
-	unregister_trace_sched_process_free(zo_on_free, NULL);
+	zo_unregister_tracepoint(&zo_trace_fork_tp, (void *)zo_on_fork);
+	zo_unregister_tracepoint(&zo_trace_free_tp, (void *)zo_on_free);
 	tracepoint_synchronize_unregister();
 }
 

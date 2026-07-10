@@ -14,7 +14,6 @@
 #include <linux/fdtable.h>
 #include <linux/jiffies.h>
 #include <linux/kernel.h>
-#include <linux/kmod.h>
 #include <linux/kprobes.h>
 #include <linux/module.h>
 #include <linux/moduleparam.h>
@@ -22,15 +21,15 @@
 #include <linux/printk.h>
 #include <linux/sched.h>
 #include <linux/string.h>
-#include <linux/syscalls.h>
 #include <linux/task_work.h>
 #include <linux/uaccess.h>
 #include <linux/uidgid.h>
-#include <linux/version.h>
 #include <linux/workqueue.h>
 
 #include "core/bootstrap.h"
 #include "core/control.h"
+#include "core/lifecycle.h"
+#include "host/runtime.h"
 #include "uapi/yukizygisk.h"
 
 enum yz_prctl_abi {
@@ -84,11 +83,7 @@ static DECLARE_DELAYED_WORK(yz_bootstrap_guard_work,
 
 static void yz_bootstrap_close_fd(unsigned int fd)
 {
-#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 11, 0)
-	ksys_close(fd);
-#else
-	close_fd(fd);
-#endif
+	yz_close_fd(fd);
 }
 
 static void yz_bootstrap_clear_cookie(void)
@@ -119,7 +114,7 @@ static bool yz_bootstrap_path_exists(const char *path)
 	struct path p;
 	int ret;
 
-	ret = kern_path(path, 0, &p);
+	ret = yz_kern_path(path, 0, &p);
 	if (ret)
 		return false;
 	path_put(&p);
@@ -130,26 +125,6 @@ static bool yz_bootstrap_services_or_later(void)
 {
 	return yz_bootstrap_path_exists("/dev/socket/zygote") ||
 	       yz_bootstrap_path_exists("/dev/socket/zygote64");
-}
-
-static void yz_bootstrap_request_self_unload(void)
-{
-	static char *argv[] = {
-		"/system/bin/toybox",
-		"rmmod",
-		"yukizygisk",
-		NULL,
-	};
-	static char *envp[] = {
-		"HOME=/",
-		"PATH=/system/bin:/system/xbin:/vendor/bin:/sbin",
-		NULL,
-	};
-	int ret;
-
-	ret = call_usermodehelper(argv[0], argv, envp, UMH_NO_WAIT);
-	if (ret)
-		pr_warn("yukizygisk: self-unload helper failed: %d\n", ret);
 }
 
 static void yz_bootstrap_guard_work_fn(struct work_struct *work)
@@ -174,8 +149,9 @@ static void yz_bootstrap_guard_work_fn(struct work_struct *work)
 
 	yz_bootstrap_clear_cookie();
 	yz_bootstrap_unregister_kprobe();
-	pr_warn("yukizygisk: zygiskd did not claim bootstrap before services; unloading\n");
-	yz_bootstrap_request_self_unload();
+	pr_warn("yukizygisk: zygiskd did not claim bootstrap before services; disabling hooks\n");
+	yukizygisk_bootstrap_fail_closed();
+	pr_warn("yukizygisk: bootstrap failed closed; waiting for external module unload\n");
 }
 
 static void yz_bootstrap_task_work(struct callback_head *head)
@@ -271,7 +247,7 @@ static int yz_bootstrap_prctl_pre(struct kprobe *kp, struct pt_regs *regs)
 	yz_bootstrap_state.out_fd = (void __user *)args.out_fd;
 	yz_bootstrap_state.pid = current->pid;
 	init_task_work(&yz_bootstrap_state.twork, yz_bootstrap_task_work);
-	ret = task_work_add(current, &yz_bootstrap_state.twork, TWA_RESUME);
+	ret = yz_task_work_add(current, &yz_bootstrap_state.twork, TWA_RESUME);
 	if (ret) {
 		yz_bootstrap_state.out_fd = NULL;
 		atomic_set(&yz_bootstrap_claimed, 0);

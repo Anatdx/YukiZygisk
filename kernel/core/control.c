@@ -28,6 +28,7 @@
 #include "feature/zygote_nl.h"
 #include "feature/zygote_probe.h"
 #include "host/host.h"
+#include "host/runtime.h"
 #include "uapi/yukizygisk.h"
 
 #define YZ_PER_USER_RANGE 100000
@@ -120,8 +121,8 @@ static void yz_unmap_tw_func(struct callback_head *cb)
 		if (pc >= tw->addr[i] && pc < tw->addr[i] + tw->size[i]) {
 			if (++tw->retry < 16) {
 				init_task_work(&tw->cb, yz_unmap_tw_func);
-				if (!task_work_add(current, &tw->cb,
-						   TWA_RESUME))
+				if (!yz_task_work_add(current, &tw->cb,
+						      TWA_RESUME))
 					return;
 			}
 			pr_warn("yukizygisk: yz_unmap pc=0x%lx still in core "
@@ -176,7 +177,7 @@ static int yz_ioctl_unmap_pid(void __user *arg)
 		tw->addr[i] = (unsigned long)cmd.addr[i];
 		tw->size[i] = (unsigned long)cmd.size[i];
 	}
-	if (task_work_add(task, &tw->cb, TWA_RESUME)) {
+	if (yz_task_work_add(task, &tw->cb, TWA_RESUME)) {
 		kfree(tw);
 		put_task_struct(task);
 		return -ESRCH;
@@ -222,7 +223,7 @@ static int yz_ioctl_unmap_self(void __user *arg)
 		tw->addr[i] = (unsigned long)cmd.addr[i];
 		tw->size[i] = (unsigned long)cmd.size[i];
 	}
-	if (task_work_add(current, &tw->cb, TWA_RESUME)) {
+	if (yz_task_work_add(current, &tw->cb, TWA_RESUME)) {
 		kfree(tw);
 		return -ESRCH;
 	}

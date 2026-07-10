@@ -18,6 +18,7 @@
 #include <linux/uaccess.h>
 
 #include "feature/zygote_ctl.h"
+#include "host/runtime.h"
 #include "uapi/yukizygisk.h"
 #include "klog.h" // IWYU pragma: keep
 
@@ -142,7 +143,7 @@ int yz_zygote_ctl_handoff(void __user *arg)
 		p->files[i] = files[i];
 	if (task) {
 		init_task_work(&p->twork, yz_deliver_cb);
-		task_work_add(task, &p->twork, TWA_RESUME);
+		yz_task_work_add(task, &p->twork, TWA_RESUME);
 	}
 	spin_unlock_irqrestore(&yz_ctl_lock, flags);
 
