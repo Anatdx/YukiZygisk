@@ -344,17 +344,30 @@ static int yz_resolve_runtime_symbols(void)
 
 int yz_host_runtime_init(void)
 {
+	int ret;
+
 	if (!yz_skip_kallsyms)
 		yz_resolve_kallsyms_lookup();
 	else
 		pr_info("yukizygisk: skipping kallsyms bootstrap\n");
 
-	yz_host_root_detect();
-	return yz_resolve_runtime_symbols();
+	ret = yz_resolve_runtime_symbols();
+	if (ret) {
+		yz_host_runtime_exit();
+		return ret;
+	}
+
+	ret = yz_host_root_detect();
+	if (ret) {
+		yz_host_runtime_exit();
+		return ret;
+	}
+	return 0;
 }
 
 void yz_host_runtime_exit(void)
 {
+	yz_host_root_exit();
 	yz_prepare_creds_fn = NULL;
 	yz_abort_creds_fn = NULL;
 	yz_override_creds_fn = NULL;

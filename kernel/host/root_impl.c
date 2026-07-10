@@ -35,6 +35,10 @@
 #define YZ_KP_MAX_VMAP_AREAS 4096
 #define YZ_KP_VM_FLAGS 0x44UL
 #define YZ_KP_SU_NAME "su_get_path"
+#define YZ_KSU_DENYLIST_UID_MAX 4096
+#define YZ_KSU_ALLOWLIST_PATH "/data/adb/ksu/.allowlist"
+
+#define YZ_ROOT_FLAG_KSU_REDIRECT (1U << 0)
 
 struct yz_kp_symbol {
 	u64 addr;
@@ -78,11 +82,14 @@ struct yz_kp_vmap_node {
 
 int yz_root_mask;
 int yz_ksu_dispatcher_nr = -1;
-int yz_policy_owner_override = YZ_POLICY_OWNER_AUTO;
+enum yz_root_owner yz_root_owner = YZ_ROOT_OWNER_NONE;
 bool yz_root_policy_allowed;
 yz_ksu_is_allow_uid_fn yz_ksu_is_allow_uid_ptr;
 yz_ksu_uid_should_umount_fn yz_ksu_uid_should_umount_ptr;
 yz_ksu_get_allow_list_fn yz_ksu_get_allow_list_ptr;
+
+static int *yz_ksu_denylist_uids;
+static u16 yz_ksu_denylist_count;
 
 const char *(*yz_ap_su_get_path)(void);
 int (*yz_ap_is_su_allow_uid)(uid_t uid);
@@ -409,7 +416,7 @@ static bool yz_path_exists(const char *path)
 	return true;
 }
 
-static bool yz_ksu_detect(void)
+static bool yz_ksu_detect(bool *policy_available)
 {
 	unsigned long addr;
 	bool seen = false;
@@ -461,7 +468,6 @@ static bool yz_ksu_detect(void)
 	if (yz_path_exists(YZ_KSU_ALLOWLIST_PATH)) {
 		yz_root_mask |= YZ_ROOT_KSU;
 		seen = true;
-		has_policy = true;
 	}
 
 	if (seen)
@@ -469,7 +475,8 @@ static bool yz_ksu_detect(void)
 			(yz_root_mask & YZ_ROOT_KSU_RDR) ? " (redirect)" : "",
 			has_policy ? "" : " (no policy source)");
 
-	return has_policy;
+	*policy_available = has_policy;
+	return seen;
 }
 
 static bool yz_magisk_detect(void)
@@ -497,80 +504,198 @@ static bool yz_magisk_detect(void)
 	return false;
 }
 
-void yz_host_root_detect(void)
+static void yz_ksu_clear_denylist(void)
 {
-	bool ksu_active;
-	bool apatch_active;
-	bool magisk_active;
-	int active_roots = 0;
+	kfree(yz_ksu_denylist_uids);
+	yz_ksu_denylist_uids = NULL;
+	yz_ksu_denylist_count = 0;
+}
 
+static YZ_NOCFI int yz_ksu_prepare_denylist(void)
+{
+	int *uids;
+	u16 out_length = 0;
+	u16 out_total = 0;
+	u16 i;
+	u16 valid = 0;
+	bool ok;
+
+	if (yz_ksu_uid_should_umount_ptr) {
+		pr_info("yukizygisk: KernelSU denylist backend: ksu_uid_should_umount\n");
+		return 0;
+	}
+	if (!yz_ksu_get_allow_list_ptr)
+		return -EOPNOTSUPP;
+
+	uids = kcalloc(YZ_KSU_DENYLIST_UID_MAX, sizeof(*uids), GFP_KERNEL);
+	if (!uids)
+		return -ENOMEM;
+
+	ok = yz_ksu_get_allow_list_ptr(uids, YZ_KSU_DENYLIST_UID_MAX,
+					     &out_length, &out_total, false);
+	if (!ok) {
+		kfree(uids);
+		return -EIO;
+	}
+	if (out_total > out_length) {
+		pr_err("yukizygisk: KernelSU denylist has %u entries, bulk API returned %u; refusing a partial policy\n",
+		       out_total, out_length);
+		kfree(uids);
+		return -E2BIG;
+	}
+
+	for (i = 0; i < out_length; i++) {
+		if (uids[i] > 0)
+			uids[valid++] = uids[i];
+	}
+	yz_ksu_denylist_uids = uids;
+	yz_ksu_denylist_count = valid;
+	pr_info("yukizygisk: KernelSU denylist backend: cached %u uid(s)\n",
+		valid);
+	return 0;
+}
+
+int yz_host_root_detect(void)
+{
+	bool ksu_seen;
+	bool ksu_policy_available = false;
+	bool apatch_seen;
+	bool magisk_seen;
+	int active_roots = 0;
+	int ret;
+
+	yz_ksu_clear_denylist();
 	yz_root_mask = YZ_ROOT_NONE;
 	yz_ksu_dispatcher_nr = -1;
+	yz_root_owner = YZ_ROOT_OWNER_NONE;
 	yz_root_policy_allowed = false;
 	yz_ksu_is_allow_uid_ptr = NULL;
 	yz_ksu_uid_should_umount_ptr = NULL;
 	yz_ksu_get_allow_list_ptr = NULL;
 
-	ksu_active = yz_ksu_detect();
-	if (!ksu_active && (yz_root_mask & YZ_ROOT_KSU))
+	ksu_seen = yz_ksu_detect(&ksu_policy_available);
+	if (ksu_seen && !ksu_policy_available)
 		pr_warn("yukizygisk: KernelSU detected without allowlist policy source\n");
 
 	if (yz_apatch_detect()) {
 		yz_root_mask |= YZ_ROOT_APATCH;
-		apatch_active = true;
+		apatch_seen = true;
 	} else {
-		apatch_active = false;
+		apatch_seen = false;
 	}
 
-	magisk_active = yz_magisk_detect();
+	magisk_seen = yz_magisk_detect();
 
-	if (ksu_active)
+	if (ksu_seen)
 		active_roots++;
-	if (apatch_active)
+	if (apatch_seen)
 		active_roots++;
-	if (magisk_active)
+	if (magisk_seen)
 		active_roots++;
 
 	if (active_roots > 1) {
 		yz_root_mask |= YZ_ROOT_MULTI;
-		pr_warn("yukizygisk: multi-root detected (mask=0x%x), automatic policy owner disabled\n",
+		pr_err("yukizygisk: multi-root detected (mask=0x%x), refusing to load\n",
 			yz_root_mask);
-		return;
+		return -EBUSY;
 	}
 
-	if (ksu_active) {
+	if (ksu_seen) {
+		if (!ksu_policy_available) {
+			pr_err("yukizygisk: KernelSU has no readable denylist backend, refusing to load\n");
+			return -EOPNOTSUPP;
+		}
+		ret = yz_ksu_prepare_denylist();
+		if (ret) {
+			pr_err("yukizygisk: KernelSU denylist backend init failed: %d\n",
+			       ret);
+			return ret;
+		}
+		yz_root_owner = YZ_ROOT_OWNER_KERNELSU;
 		yz_root_policy_allowed = true;
-		pr_info("yukizygisk: root policy owner: KernelSU backend\n");
-		return;
+		pr_info("yukizygisk: root owner accepted: KernelSU%s\n",
+			(yz_root_mask & YZ_ROOT_KSU_RDR) ? " (redirect)" : "");
+		return 0;
 	}
 
-	if (apatch_active) {
+	if (apatch_seen) {
+		if (!yz_ap_get_mod_exclude) {
+			pr_err("yukizygisk: KernelPatch has no readable denylist backend, refusing to load\n");
+			return -EOPNOTSUPP;
+		}
+		yz_root_owner = YZ_ROOT_OWNER_KERNELPATCH;
 		yz_root_policy_allowed = true;
-		pr_info("yukizygisk: root policy owner: APatch backend\n");
-		return;
+		pr_info("yukizygisk: root owner accepted: KernelPatch\n");
+		return 0;
 	}
 
-	if (!magisk_active)
-		yz_root_mask |= YZ_ROOT_NON_ROOT;
-	pr_warn("yukizygisk: no automatic kernel root policy owner (mask=0x%x)\n",
+	if (magisk_seen) {
+		pr_err("yukizygisk: Magisk-only environment is unsupported, refusing to load\n");
+		return -EOPNOTSUPP;
+	}
+
+	yz_root_mask |= YZ_ROOT_NON_ROOT;
+	pr_err("yukizygisk: no supported root implementation found (mask=0x%x), refusing to load\n",
 		yz_root_mask);
+	return -ENODEV;
 }
 
 bool yz_host_root_allows_policy(void)
 {
-	switch (READ_ONCE(yz_policy_owner_override)) {
-	case YZ_POLICY_OWNER_DISABLED:
-		return false;
-	case YZ_POLICY_OWNER_KERNELSU:
-	case YZ_POLICY_OWNER_APATCH:
-	case YZ_POLICY_OWNER_MANUAL:
-		return true;
-	case YZ_POLICY_OWNER_MAGISK:
-		return false;
-	case YZ_POLICY_OWNER_AUTO:
-	default:
-		break;
-	}
-
 	return READ_ONCE(yz_root_policy_allowed);
+}
+
+YZ_NOCFI bool yz_host_uid_should_umount(uid_t uid)
+{
+	u16 i;
+
+	if (uid == 0 || !READ_ONCE(yz_root_policy_allowed))
+		return false;
+
+	switch (READ_ONCE(yz_root_owner)) {
+	case YZ_ROOT_OWNER_KERNELSU:
+		if (yz_ksu_uid_should_umount_ptr)
+			return yz_ksu_uid_should_umount_ptr(uid);
+		for (i = 0; i < READ_ONCE(yz_ksu_denylist_count); i++) {
+			if (yz_ksu_denylist_uids[i] == (int)uid)
+				return true;
+		}
+		return false;
+	case YZ_ROOT_OWNER_KERNELPATCH:
+		return yz_ap_get_mod_exclude && yz_ap_get_mod_exclude(uid) != 0;
+	case YZ_ROOT_OWNER_NONE:
+	default:
+		return false;
+	}
+}
+
+const char *yz_host_root_name(void)
+{
+	switch (READ_ONCE(yz_root_owner)) {
+	case YZ_ROOT_OWNER_KERNELSU:
+		return (yz_root_mask & YZ_ROOT_KSU_RDR) ?
+			"kernelsu-redirect" : "kernelsu";
+	case YZ_ROOT_OWNER_KERNELPATCH:
+		return "kernelpatch";
+	case YZ_ROOT_OWNER_NONE:
+	default:
+		return "unsupported";
+	}
+}
+
+u32 yz_host_root_flags(void)
+{
+	return (yz_root_mask & YZ_ROOT_KSU_RDR) ?
+		YZ_ROOT_FLAG_KSU_REDIRECT : 0;
+}
+
+void yz_host_root_exit(void)
+{
+	yz_root_policy_allowed = false;
+	yz_root_owner = YZ_ROOT_OWNER_NONE;
+	yz_ksu_clear_denylist();
+	yz_ksu_is_allow_uid_ptr = NULL;
+	yz_ksu_uid_should_umount_ptr = NULL;
+	yz_ksu_get_allow_list_ptr = NULL;
+	yz_ap_clear_symbols();
 }

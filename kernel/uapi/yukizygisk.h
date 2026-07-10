@@ -181,6 +181,31 @@ struct yz_safemode_status_cmd {
 	char zygote[YZ_ZYGOTE_NAME_MAX];
 };
 
+#define YZ_IOCTL_GET_ROOT_STATUS _IOC(_IOC_READ, YZ_IOCTL_MAGIC, 61, 0)
+
+enum yz_root_owner_uapi {
+	YZ_ROOT_OWNER_UAPI_NONE = 0,
+	YZ_ROOT_OWNER_UAPI_KERNELSU = 1,
+	YZ_ROOT_OWNER_UAPI_KERNELPATCH = 2,
+};
+
+#define YZ_ROOT_STATUS_KSU_REDIRECT (1U << 0)
+
+struct yz_root_status_cmd {
+	__u32 owner;
+	__u32 mask;
+	__u32 flags;
+	__u32 reserved;
+};
+
+#define YZ_IOCTL_UID_SHOULD_UMOUNT                                  \
+	_IOC(_IOC_READ | _IOC_WRITE, YZ_IOCTL_MAGIC, 62, 0)
+
+struct yz_uid_policy_cmd {
+	__u32 uid;
+	__u32 should_umount;
+};
+
 struct yz_config {
 	__u8 yukilinker;
 	__u8 denylist_mode;

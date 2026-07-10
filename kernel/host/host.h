@@ -29,6 +29,12 @@ struct yz_file_load_policy {
 	u32 process_added_av;
 };
 
+struct yz_host_root_status {
+	u32 owner;
+	u32 mask;
+	u32 flags;
+};
+
 int yz_host_init(void);
 void yz_host_exit(void);
 
@@ -36,6 +42,8 @@ const struct cred *yz_host_override_creds(void);
 void yz_host_revert_creds(const struct cred *old_cred);
 
 bool yz_host_is_zygote(const struct cred *cred);
+void yz_host_get_root_status(struct yz_host_root_status *status);
+bool yz_host_uid_should_umount(uid_t uid);
 
 int yz_host_file_load_policy_allow_current(
 	struct file *file, struct yz_file_load_policy *state);

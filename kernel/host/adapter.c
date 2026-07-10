@@ -52,7 +52,8 @@ int yz_host_init(void)
 	}
 	pr_info("yukizygisk: host step privileged creds done\n");
 
-	pr_info("yukizygisk: host roots mask=0x%x policy=%s\n", yz_root_mask,
+	pr_info("yukizygisk: host root=%s mask=0x%x policy=%s\n",
+		yz_host_root_name(), yz_root_mask,
 		yz_host_root_allows_policy() ? "available" : "unavailable");
 	return 0;
 }
@@ -81,6 +82,15 @@ void yz_host_revert_creds(const struct cred *old_cred)
 bool yz_host_is_zygote(const struct cred *cred)
 {
 	return yz_host_policy_cred_has_type(cred, "zygote");
+}
+
+void yz_host_get_root_status(struct yz_host_root_status *status)
+{
+	if (!status)
+		return;
+	status->owner = (u32)READ_ONCE(yz_root_owner);
+	status->mask = (u32)READ_ONCE(yz_root_mask);
+	status->flags = yz_host_root_flags();
 }
 
 int yz_host_file_load_policy_allow_current(

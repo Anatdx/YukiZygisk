@@ -22,7 +22,12 @@ Current state:
   preserve source-level build boundaries while the remaining SELinux,
   root-backend, and daemon integrations are extracted.
 - `host/runtime.c` and `host/root_impl.c` reuse Kasumi's runtime symbol
-  resolver and root implementation detector under YukiZygisk naming.
+  resolver and root implementation detector under YukiZygisk naming. Host init
+  accepts one KernelSU or KernelPatch/APatch owner with a readable denylist and
+  rejects Magisk-only, multi-root, and no-root environments.
+- `YZ_IOCTL_GET_ROOT_STATUS` exposes the accepted owner and KernelSU redirect
+  state; `YZ_IOCTL_UID_SHOULD_UMOUNT` routes full-UID policy queries through the
+  YukiZygisk host boundary.
 - `host/lsm.c` provides the versioned LSM hook backend for the AT_ENTRY
   interception point. It patches `static_calls_table` on 6.12+ and
   `security_hook_heads` on older kernels.
@@ -37,10 +42,10 @@ Current state:
   KSU/Magisk/APatch/YukiZygisk and `/data/adb` module mounts itself instead of
   depending on KSU `kernel_umount`.
 
-This is not yet a complete replacement for the YukiSU-integrated module. KSU,
-KernelPatch, APatch, Magisk, and other root stacks should be modeled as host
-backends rather than core dependencies. The remaining hard dependencies are
-documented in `docs/source-inventory.md`.
+This is not yet a complete replacement for the YukiSU-integrated module.
+KernelSU and KernelPatch/APatch are modeled as host backends rather than core
+owners; other root states are currently unsupported. The remaining hard
+dependencies are documented in `docs/source-inventory.md`.
 
 The standalone ioctl ABI uses only `YZ_IOCTL_*` with magic `'Y'`, but the ioctl
 file is delivered by one-shot bootstrap instead of a public device node. Do not

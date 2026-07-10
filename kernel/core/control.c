@@ -93,6 +93,33 @@ static int yz_ioctl_get_safemode(void __user *arg)
 	return 0;
 }
 
+static int yz_ioctl_get_root_status(void __user *arg)
+{
+	struct yz_host_root_status status = { 0 };
+	struct yz_root_status_cmd cmd = { 0 };
+
+	yz_host_get_root_status(&status);
+	cmd.owner = status.owner;
+	cmd.mask = status.mask;
+	cmd.flags = status.flags;
+
+	if (copy_to_user(arg, &cmd, sizeof(cmd)))
+		return -EFAULT;
+	return 0;
+}
+
+static int yz_ioctl_uid_should_umount(void __user *arg)
+{
+	struct yz_uid_policy_cmd cmd;
+
+	if (copy_from_user(&cmd, arg, sizeof(cmd)))
+		return -EFAULT;
+	cmd.should_umount = yz_host_uid_should_umount((uid_t)cmd.uid) ? 1 : 0;
+	if (copy_to_user(arg, &cmd, sizeof(cmd)))
+		return -EFAULT;
+	return 0;
+}
+
 static int yz_ioctl_umount_pid(void __user *arg)
 {
 	struct yz_umount_pid_cmd cmd;
@@ -296,6 +323,10 @@ static long yukizygisk_ioctl(struct file *file, unsigned int request,
 		return yz_ioctl_restore_native_load_policy(uarg);
 	case YZ_IOCTL_GET_SAFEMODE:
 		return yz_ioctl_get_safemode(uarg);
+	case YZ_IOCTL_GET_ROOT_STATUS:
+		return yz_ioctl_get_root_status(uarg);
+	case YZ_IOCTL_UID_SHOULD_UMOUNT:
+		return yz_ioctl_uid_should_umount(uarg);
 	default:
 		return -ENOTTY;
 	}

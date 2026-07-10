@@ -34,7 +34,6 @@
 #include <elf.h>
 #include <pthread.h>
 
-#include <algorithm>
 #include <cctype>
 #include <cerrno>
 #include <cstddef>
@@ -45,6 +44,7 @@
 #include <limits.h>
 #include <sstream>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include <csignal>
@@ -263,6 +263,20 @@ int ctl(int request, void *arg) {
 bool control_fd_works() {
   yz_safemode_status_cmd cmd{};
   return ctl(YZ_IOCTL_GET_SAFEMODE, &cmd) == 0;
+}
+
+bool get_root_status(yz_root_status_cmd *status) {
+  if (status == nullptr)
+    return false;
+  *status = {};
+  return ctl(YZ_IOCTL_GET_ROOT_STATUS, status) == 0;
+}
+
+bool uid_should_umount(uint32_t uid) {
+  yz_uid_policy_cmd cmd{};
+  cmd.uid = uid;
+  return ctl(YZ_IOCTL_UID_SHOULD_UMOUNT, &cmd) == 0 &&
+         cmd.should_umount != 0;
 }
 
 bool lsetfilecon(const std::string &path, const char *context) {
@@ -933,21 +947,16 @@ static bool yz_revert_app_mounts(pid_t app_pid) {
 }
 
 yz_config g_yz_config{1, 0, 0, 0};
-std::vector<uint32_t> g_denylist_appids;
 
 uint32_t query_flags(uint32_t uid) {
   uint32_t flags = 0;
-  uint32_t appid = uid % 100000u;
-  if (g_yz_config.denylist_mode != 0 &&
-      std::find(g_denylist_appids.begin(), g_denylist_appids.end(), appid) !=
-          g_denylist_appids.end())
+  if (g_yz_config.denylist_mode != 0 && yzhost::uid_should_umount(uid))
     flags |= 1u << 1;
   return flags;
 }
 
 void read_yzconfig() {
   yz_config cfg{1, 0, 0, 0};
-  std::vector<uint32_t> denylist_appids;
   int fd = open(yzhost::config_path().c_str(), O_RDONLY | O_CLOEXEC);
   if (fd >= 0) {
     std::string buf;
@@ -966,33 +975,14 @@ void read_yzconfig() {
       }
       if (root.contains("dmesg_log"))
         cfg.dmesg_log = root.at("dmesg_log").as_bool() ? 1 : 0;
-      if (root.contains("denylist_app_ids") &&
-          root.at("denylist_app_ids").type == json::Type::Array) {
-        for (const auto &entry : root.at("denylist_app_ids").as_array()) {
-          if (entry.type != json::Type::Number)
-            continue;
-          double value = entry.as_number();
-          if (value < 0 || value >= 100000)
-            continue;
-          uint32_t appid = static_cast<uint32_t>(value);
-          if (value != static_cast<double>(appid))
-            continue;
-          if (std::find(denylist_appids.begin(), denylist_appids.end(),
-                        appid) == denylist_appids.end())
-            denylist_appids.push_back(appid);
-        }
-        std::sort(denylist_appids.begin(), denylist_appids.end());
-      }
     }
   }
   g_yz_config = cfg;
-  g_denylist_appids = std::move(denylist_appids);
   yz_yukilinker_cmd yc{};
   yc.enabled = cfg.yukilinker;
   yzhost::ctl(YZ_IOCTL_SET_YUKILINKER, &yc);
-  DLOGI("yzconfig: yukilinker=%u denylist_mode=%u dmesg_log=%u denylist=%zu",
-        cfg.yukilinker, cfg.denylist_mode, cfg.dmesg_log,
-        g_denylist_appids.size());
+  DLOGI("yzconfig: yukilinker=%u denylist_mode=%u dmesg_log=%u",
+        cfg.yukilinker, cfg.denylist_mode, cfg.dmesg_log);
 }
 
 void refresh_safemode_status() {
@@ -1377,6 +1367,8 @@ bool peer_can_query_status(int client, struct ucred *cred) {
 /* Compact status JSON for the manager and root-side health checks. */
 std::string build_status_json() {
   bool kernel_alive = yzhost::control_fd_works();
+  yz_root_status_cmd root_status{};
+  bool root_status_ok = yzhost::get_root_status(&root_status);
   refresh_safemode_status();
   prune_dead_native_injections();
 
@@ -1387,6 +1379,25 @@ std::string build_status_json() {
   s += ",\"abi\":\"";
   json_append_escaped(s, kAbi);
   s += "\"";
+  s += ",\"root_impl\":\"";
+  if (!root_status_ok)
+    s += "unknown";
+  else if (root_status.owner == YZ_ROOT_OWNER_UAPI_KERNELSU)
+    s += (root_status.flags & YZ_ROOT_STATUS_KSU_REDIRECT) != 0
+             ? "kernelsu-redirect"
+             : "kernelsu";
+  else if (root_status.owner == YZ_ROOT_OWNER_UAPI_KERNELPATCH)
+    s += "kernelpatch";
+  else
+    s += "unsupported";
+  s += "\"";
+  s += ",\"root_mask\":";
+  s += std::to_string(root_status.mask);
+  s += ",\"ksu_redirect\":";
+  s += (root_status_ok &&
+        (root_status.flags & YZ_ROOT_STATUS_KSU_REDIRECT) != 0)
+           ? "true"
+           : "false";
   s += ",\"count\":";
   s += std::to_string(g_inject_count);
   s += ",\"safe_mode\":";
@@ -1403,17 +1414,8 @@ std::string build_status_json() {
   s += std::to_string(g_yz_config.denylist_mode);
   s += ",\"dmesg_log\":";
   s += g_yz_config.dmesg_log ? "true" : "false";
-  s += ",\"denylist_app_ids\":[";
-  bool first = true;
-  for (uint32_t appid : g_denylist_appids) {
-    if (!first)
-      s += ',';
-    first = false;
-    s += std::to_string(appid);
-  }
-  s += "]";
   s += ",\"recent\":[";
-  first = true;
+  bool first = true;
   for (uint32_t a : g_recent_appids) {
     if (!first)
       s += ',';

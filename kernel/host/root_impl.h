@@ -12,8 +12,6 @@
 
 #include <linux/types.h>
 
-#define YZ_KSU_ALLOWLIST_PATH "/data/adb/ksu/.allowlist"
-
 enum yz_root_impl_type {
 	YZ_ROOT_NONE = 0,
 	YZ_ROOT_KSU = 1 << 0,
@@ -24,13 +22,10 @@ enum yz_root_impl_type {
 	YZ_ROOT_NON_ROOT = 1 << 5,
 };
 
-enum yz_root_policy_owner {
-	YZ_POLICY_OWNER_AUTO = 0,
-	YZ_POLICY_OWNER_KERNELSU = 1,
-	YZ_POLICY_OWNER_APATCH = 2,
-	YZ_POLICY_OWNER_MAGISK = 3,
-	YZ_POLICY_OWNER_MANUAL = 4,
-	YZ_POLICY_OWNER_DISABLED = 5,
+enum yz_root_owner {
+	YZ_ROOT_OWNER_NONE = 0,
+	YZ_ROOT_OWNER_KERNELSU = 1,
+	YZ_ROOT_OWNER_KERNELPATCH = 2,
 };
 
 struct yz_ap_su_profile {
@@ -47,7 +42,7 @@ typedef bool (*yz_ksu_get_allow_list_fn)(int *array, u16 length,
 
 extern int yz_root_mask;
 extern int yz_ksu_dispatcher_nr;
-extern int yz_policy_owner_override;
+extern enum yz_root_owner yz_root_owner;
 extern bool yz_root_policy_allowed;
 extern yz_ksu_is_allow_uid_fn yz_ksu_is_allow_uid_ptr;
 extern yz_ksu_uid_should_umount_fn yz_ksu_uid_should_umount_ptr;
@@ -67,7 +62,11 @@ extern int (*yz_ap_read_kstorage)(int gid, long did, void *data, int offset,
 extern int (*yz_ap_list_kstorage_ids)(int gid, long *ids, int idslen,
 				      bool data_is_user);
 
-void yz_host_root_detect(void);
+int yz_host_root_detect(void);
+void yz_host_root_exit(void);
 bool yz_host_root_allows_policy(void);
+bool yz_host_uid_should_umount(uid_t uid);
+const char *yz_host_root_name(void);
+u32 yz_host_root_flags(void);
 
 #endif /* _YUKIZYGISK_HOST_ROOT_IMPL_H */
