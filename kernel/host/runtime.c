@@ -10,11 +10,13 @@
 
 #include <linux/err.h>
 #include <linux/file.h>
+#include <linux/kallsyms.h>
 #include <linux/kprobes.h>
 #include <linux/moduleparam.h>
 #include <linux/printk.h>
 #include <linux/task_work.h>
 #include <linux/string.h>
+#include <linux/version.h>
 
 #include "host/root_impl.h"
 #include "host/runtime.h"
@@ -45,9 +47,12 @@ static int (*yz_task_work_add_fn)(struct task_struct *task,
 static long (*yz_copy_from_kernel_nofault_fn)(void *dst, const void *src,
 					      size_t size);
 static bool yz_copy_from_kernel_nofault_tried;
-static bool (*yz_kallsyms_lookup_size_offset_fn)(unsigned long addr,
-						 unsigned long *symbolsize,
-						 unsigned long *offset);
+/*
+ * Keep this pointer tied to the kernel declaration. Unlike private-symbol
+ * adapters, this known API is deliberately CFI/KCFI-checked at the call site.
+ */
+static typeof(&kallsyms_lookup_size_offset)
+	yz_kallsyms_lookup_size_offset_fn;
 
 bool yz_valid_kernel_addr(unsigned long addr)
 {
@@ -196,20 +201,29 @@ YZ_INDIRECT_CALL bool yz_kernel_read_nofault(void *dst, unsigned long src,
 	       yz_copy_from_kernel_nofault_fn(dst, (const void *)src, size) == 0;
 }
 
-YZ_INDIRECT_CALL bool yz_lookup_size_offset(unsigned long addr,
-				    unsigned long *symbolsize,
-				    unsigned long *offset)
+__attribute__((__noinline__)) bool
+yz_lookup_size_offset(unsigned long addr, unsigned long *symbolsize,
+			      unsigned long *offset)
 {
 	if (!yz_kallsyms_lookup_size_offset_fn) {
-		unsigned long sym =
-			yz_lookup_callable_quiet("kallsyms_lookup_size_offset");
+		unsigned long sym;
+
+		/*
+		 * Match official KernelSU's resolver split: KCFI uses the raw
+		 * entry; old jump-table CFI prefers the generated callable thunk.
+		 */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 1, 0)
+		sym = yz_lookup_name_quiet("kallsyms_lookup_size_offset");
+#else
+		sym = yz_lookup_callable_quiet("kallsyms_lookup_size_offset");
+#endif
 
 		if (sym && yz_valid_kernel_addr(sym))
 			yz_kallsyms_lookup_size_offset_fn = (void *)sym;
 	}
 
 	return yz_kallsyms_lookup_size_offset_fn &&
-	       yz_kallsyms_lookup_size_offset_fn(addr, symbolsize, offset);
+	       yz_kallsyms_lookup_size_offset_fn(addr, symbolsize, offset) != 0;
 }
 
 YZ_INDIRECT_CALL struct cred *yz_prepare_creds(void)
