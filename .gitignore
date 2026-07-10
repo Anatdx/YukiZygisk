@@ -38,3 +38,6 @@
 .tmp_versions/
 Module.symvers
 modules.order
+
+# Local build artifacts
+build/

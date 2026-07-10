@@ -19,4 +19,14 @@ License
   - LICENSE             Apache License, Version 2.0 (full text)
   - LICENSE-GPL-2.0     GNU General Public License v2.0 (full text)
 
+Third-party components
+
+  - The Zygisk public API header is derived from Magisk and is distributed
+    under its original ISC terms. Copyright (c) 2022-2023 John "topjohnwu" Wu.
+  - LSPlt is distributed under LGPL-3.0. Copyright (c) 2022 LSPosed.
+    The complete linked source and build files are available in this source
+    tree; packaged builds include the LSPlt license as LICENSE-LSPLT.
+  - XZ Embedded is by Lasse Collin and Igor Pavlov and has been placed in the
+    public domain by its authors.
+
 SPDX-License-Identifier: Apache-2.0 OR GPL-2.0
