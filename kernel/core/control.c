@@ -384,6 +384,8 @@ static long yukizygisk_ioctl(struct file *file, unsigned int request,
 		return yz_ioctl_set_policy_cache(uarg);
 	case YZ_IOCTL_GET_ZYGOTE_VARIANTS:
 		return yz_ioctl_get_zygote_variants(uarg);
+	case YZ_IOCTL_PREPARE_RUNTIME_POLICY:
+		return yz_host_prepare_runtime_policy();
 	default:
 		return -ENOTTY;
 	}

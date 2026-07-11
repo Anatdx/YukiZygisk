@@ -93,6 +93,11 @@ void yz_host_get_root_status(struct yz_host_root_status *status)
 	status->flags = yz_host_root_flags();
 }
 
+int yz_host_prepare_runtime_policy(void)
+{
+	return yz_host_policy_prepare_runtime_current();
+}
+
 int yz_host_file_load_policy_allow_current(
 	struct file *file, struct yz_file_load_policy *state)
 {

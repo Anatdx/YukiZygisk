@@ -2046,6 +2046,13 @@ int run_daemon(int argc, char **argv) {
     return 1;
   }
 
+  if (yzhost::ctl(YZ_IOCTL_PREPARE_RUNTIME_POLICY, nullptr) != 0) {
+    DLOGE("failed to prepare runtime SELinux policy: %s", strerror(errno));
+    close(srv);
+    notify_ready(ready_fd, false);
+    return 1;
+  }
+
   int nlfd = nl_listen();
   yz_root_status_cmd root_status{};
   bool policy_ready = false;

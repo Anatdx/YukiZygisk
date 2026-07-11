@@ -40,6 +40,13 @@ struct yz_policy_edit {
 	size_t len;
 };
 
+static YZ_INDIRECT_CALL int
+yz_policy_begin_edit_locked(struct yz_policy_edit *edit);
+static YZ_INDIRECT_CALL void
+yz_policy_cancel_edit_locked(struct yz_policy_edit *edit);
+static YZ_INDIRECT_CALL void
+yz_policy_commit_edit_locked(struct yz_policy_edit *edit);
+
 typedef int (*yz_policydb_write_fn)(struct policydb *p, void *fp);
 typedef int (*yz_security_load_policy_fn)(
 	void *data, size_t len, struct selinux_load_state *load_state);
@@ -82,6 +89,62 @@ static const char *const yz_tmpfs_load_perms[] = {
 
 static const char *const yz_process_execmem_perms[] = {
 	"execmem",
+};
+
+static const char *const yz_runtime_socket_perms[] = {
+	"read", "write", "connectto", "getopt", "getattr",
+};
+
+static const char *const yz_runtime_fd_perms[] = {
+	"use",
+};
+
+static const char *const yz_runtime_fifo_perms[] = {
+	"read", "write", "open", "getattr",
+};
+
+static const char *const yz_runtime_memfd_perms[] = {
+	"execute", "getattr", "map", "read", "write",
+};
+
+static const char *const yz_runtime_process_perms[] = {
+	"sigchld",
+};
+
+struct yz_runtime_policy_class {
+	const char *name;
+	const char *const *perms;
+	size_t perm_count;
+	bool optional;
+};
+
+static const struct yz_runtime_policy_class yz_runtime_policy_classes[] = {
+	{
+		.name = "unix_stream_socket",
+		.perms = yz_runtime_socket_perms,
+		.perm_count = ARRAY_SIZE(yz_runtime_socket_perms),
+	},
+	{
+		.name = "fd",
+		.perms = yz_runtime_fd_perms,
+		.perm_count = ARRAY_SIZE(yz_runtime_fd_perms),
+	},
+	{
+		.name = "fifo_file",
+		.perms = yz_runtime_fifo_perms,
+		.perm_count = ARRAY_SIZE(yz_runtime_fifo_perms),
+	},
+	{
+		.name = "memfd_file",
+		.perms = yz_runtime_memfd_perms,
+		.perm_count = ARRAY_SIZE(yz_runtime_memfd_perms),
+		.optional = true,
+	},
+	{
+		.name = "process",
+		.perms = yz_runtime_process_perms,
+		.perm_count = ARRAY_SIZE(yz_runtime_process_perms),
+	},
 };
 
 bool yz_policy_base_ready(void)
@@ -192,10 +255,10 @@ yz_policy_perm_mask(struct class_datum *cls, const char *perm_name)
 }
 
 static u32 yz_policy_required_av(struct class_datum *cls,
-				 const char *const *perms, int count)
+				 const char *const *perms, size_t count)
 {
 	u32 av = 0;
-	int i;
+	size_t i;
 
 	for (i = 0; i < count; i++)
 		av |= yz_policy_perm_mask(cls, perms[i]);
@@ -267,7 +330,7 @@ yz_policy_remove_avtab_node(struct policydb *db, struct avtab_node *node)
 	struct avtab_node *cur;
 	struct avtab_node *prev;
 	int ret;
-	int i;
+	size_t i;
 
 	ret = yz_avtab_alloc_ptr(&removed, 1);
 	if (ret < 0)
@@ -336,6 +399,108 @@ yz_policy_apply_av(struct policydb *db, const struct yz_policy_key *key,
 		yz_policy_remove_avtab_node(db, node);
 
 	return 0;
+}
+
+static YZ_INDIRECT_CALL int yz_policy_allow_all_sources(
+	struct policydb *db, u32 target_type,
+	const struct yz_runtime_policy_class *spec)
+{
+	struct class_datum *cls;
+	struct yz_policy_key key = {
+		.tgt_type = target_type,
+	};
+	u32 av;
+	u32 src_type;
+
+	cls = yz_symtab_search_ptr(&db->p_classes, spec->name);
+	if (!cls || cls->value > U16_MAX)
+		return spec->optional ? 0 : -ENOENT;
+
+	av = yz_policy_required_av(cls, spec->perms, spec->perm_count);
+	if (!av)
+		return spec->optional ? 0 : -ENOENT;
+	key.tclass = (u16)cls->value;
+
+	for (src_type = 1; src_type <= db->p_types.nprim; src_type++) {
+		const char *name = yz_policy_type_name_by_value(db, src_type);
+		struct type_datum *type;
+		int ret;
+
+		if (!name)
+			continue;
+		type = yz_symtab_search_ptr(&db->p_types, name);
+		if (!type || type->attribute)
+			continue;
+
+		key.src_type = src_type;
+		ret = yz_policy_apply_av(db, &key, av, true);
+		if (ret)
+			return ret;
+	}
+
+	return 0;
+}
+
+int yz_host_policy_prepare_runtime_current(void)
+{
+	struct task_security_struct *tsec;
+	struct selinux_policy *policy;
+	struct context *target_context;
+	struct yz_policy_edit edit;
+	char target_name[64];
+	u32 target_type;
+	size_t i;
+	int ret;
+
+	ret = yz_policy_base_lock();
+	if (ret)
+		return ret;
+
+	tsec = yz_policy_cred_security(current_cred());
+	if (!tsec || !tsec->sid) {
+		ret = -EINVAL;
+		goto out_unlock;
+	}
+
+	policy = rcu_dereference_protected(
+		yz_selinux_state->policy,
+		lockdep_is_held(&yz_selinux_state->policy_mutex));
+	if (!policy) {
+		ret = -ENOENT;
+		goto out_unlock;
+	}
+	target_context = yz_policy_sidtab_search(policy->sidtab, tsec->sid);
+	if (!target_context) {
+		ret = -ENOENT;
+		goto out_unlock;
+	}
+	target_type = target_context->type;
+	yz_policy_copy_type_name(target_name, sizeof(target_name),
+				 &policy->policydb, target_type);
+
+	ret = yz_policy_begin_edit_locked(&edit);
+	if (ret)
+		goto out_unlock;
+
+	for (i = 0; i < ARRAY_SIZE(yz_runtime_policy_classes); i++) {
+		ret = yz_policy_allow_all_sources(
+			&edit.load_state.policy->policydb, target_type,
+			&yz_runtime_policy_classes[i]);
+		if (ret)
+			goto out_cancel;
+	}
+
+	yz_policy_commit_edit_locked(&edit);
+	pr_info("yukizygisk: runtime SELinux communication allowed to daemon type=%s\n",
+		target_name);
+	ret = 0;
+	goto out_unlock;
+
+out_cancel:
+	yz_policy_cancel_edit_locked(&edit);
+out_unlock:
+	yz_policy_base_unlock();
+	return ret;
 }
 
 static YZ_INDIRECT_CALL int

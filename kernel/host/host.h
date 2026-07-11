@@ -47,6 +47,7 @@ bool yz_host_policy_uses_fallback(void);
 bool yz_host_policy_cache_ready(void);
 int yz_host_uid_should_umount(uid_t uid, bool *should_umount);
 int yz_host_install_policy_cache(struct file *file);
+int yz_host_prepare_runtime_policy(void);
 
 int yz_host_file_load_policy_allow_current(
 	struct file *file, struct yz_file_load_policy *state);

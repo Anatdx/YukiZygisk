@@ -260,6 +260,9 @@ struct yz_zygote_variants_cmd {
 #define YZ_IOCTL_GET_ZYGOTE_VARIANTS                                \
 	_IOC(_IOC_READ, YZ_IOCTL_MAGIC, 64, 0)
 
+#define YZ_IOCTL_PREPARE_RUNTIME_POLICY \
+	_IOC(_IOC_NONE, YZ_IOCTL_MAGIC, 65, 0)
+
 struct yz_config {
 	__u8 yukilinker;
 	__u8 denylist_mode;
