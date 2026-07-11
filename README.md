@@ -2,19 +2,6 @@
 
 A new kernel-level Zygisk implementation designed to explore better, cleaner, and more flexible ways of injecting.
 
-## Project Notes
-
-This repository is the extraction target for the YukiZygisk work currently living in YukiSU.
-
-Start here:
-
-- [AGENTS.md](AGENTS.md) - working rules for agents and maintainers.
-- [docs/project-state.md](docs/project-state.md) - current YukiSU source state and verified capability snapshot.
-- [docs/architecture.md](docs/architecture.md) - current architecture boundaries and source map.
-- [docs/extraction-plan.md](docs/extraction-plan.md) - staged plan for turning the YukiSU branch into a standalone project.
-- [docs/source-inventory.md](docs/source-inventory.md) - exact imported source files and remaining host dependencies.
-- [docs/validation-and-device-safety.md](docs/validation-and-device-safety.md) - build checks, CI checks, and device-operation constraints.
-
 ## Kernel LKM Skeleton
 
 The standalone kernel sources live in [kernel](kernel). A single test KMI can
