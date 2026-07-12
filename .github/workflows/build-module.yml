@@ -114,3 +114,47 @@ jobs:
           name: YukiZygisk-module-all-kmi-arm64-v8a
           path: build/out/YukiZygisk-*-all-kmi-arm64-v8a.zip
           if-no-files-found: error
+
+  post-telegram:
+    name: Post package to Telegram
+    needs: package
+    if: github.event_name == 'push' && (github.ref_name == 'main' || startsWith(github.ref_name, 'feat/'))
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout uploader
+        uses: actions/checkout@v6
+        with:
+          sparse-checkout: scripts
+
+      - name: Download module package
+        uses: actions/download-artifact@v7
+        with:
+          name: YukiZygisk-module-all-kmi-arm64-v8a
+          path: dist
+
+      - name: Upload package to Telegram
+        env:
+          BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          SESSION_STRING: ${{ secrets.TELEGRAM_SESSION_STRING }}
+          MESSAGE_THREAD_ID: ${{ secrets.TELEGRAM_MESSAGE_THREAD_ID }}
+          COMMIT_URL: ${{ github.server_url }}/${{ github.repository }}/commit/${{ github.sha }}
+          COMMIT_MESSAGE: ${{ github.event.head_commit.message }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          TITLE: YukiZygisk module (all KMI)
+          VERSION: ${{ github.run_number }}
+          BRANCH: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          if [ -z "$BOT_TOKEN" ] || [ -z "$CHAT_ID" ]; then
+            echo "TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID is not set; skipping Telegram upload."
+            exit 0
+          fi
+
+          python3 -m pip install --quiet telethon==1.34.0
+          mapfile -d '' -t files < <(find dist -maxdepth 1 -type f -name 'YukiZygisk-*-all-kmi-arm64-v8a.zip' -print0)
+          if [ "${#files[@]}" -eq 0 ]; then
+            echo "No all-KMI YukiZygisk package found."
+            exit 1
+          fi
+          python3 scripts/yzbot.py "${files[@]}"

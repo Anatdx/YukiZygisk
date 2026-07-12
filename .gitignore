@@ -41,3 +41,6 @@ modules.order
 
 # Local build artifacts
 build/
+
+# Telegram bot session (contains authorization data)
+scripts/.yzbot_session
