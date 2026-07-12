@@ -190,7 +190,7 @@ static void zp_native_policy_timeout(struct work_struct *work)
 	if (!restore)
 		return;
 
-	pr_info("zygote_probe: native policy timeout pid=%d added=0x%x "
+	pr_info("zygote_probe: load policy timeout pid=%d added=0x%x "
 		"tmpfs=0x%x process=0x%x\n",
 		entry->tgid, entry->state.added_av, entry->state.tmpfs_added_av,
 		entry->state.process_added_av);
@@ -211,7 +211,7 @@ static void zp_publish_native_policy_state(pid_t tgid,
 
 	entry = kzalloc(sizeof(*entry), GFP_KERNEL);
 	if (!entry) {
-		pr_info("zygote_probe: native policy pid=%d alloc failed, "
+		pr_info("zygote_probe: load policy pid=%d alloc failed, "
 			"restoring immediately\n",
 			tgid);
 		zp_restore_native_policy_state(state);
@@ -242,7 +242,7 @@ static void zp_publish_native_policy_state(pid_t tgid,
 		zp_restore_native_policy_state(&cur->state);
 		kfree(cur);
 	}
-	pr_info("zygote_probe: native policy pid=%d pending added=0x%x "
+	pr_info("zygote_probe: load policy pid=%d pending added=0x%x "
 		"tmpfs=0x%x process=0x%x\n",
 		tgid, entry->state.added_av, entry->state.tmpfs_added_av,
 		entry->state.process_added_av);
@@ -274,7 +274,7 @@ int yz_zygote_probe_restore_native_policy(pid_t tgid)
 		kfree(entry);
 		n++;
 	}
-	pr_info("zygote_probe: native policy restore pid=%d entries=%d\n", tgid,
+	pr_info("zygote_probe: load policy restore pid=%d entries=%d\n", tgid,
 		n);
 	return 0;
 }
@@ -935,7 +935,7 @@ static int zp_stage_fd(const char *path, const char *name,
 		int ret =
 		    yz_host_file_load_policy_allow_current(src, policy_state);
 		if (ret)
-			pr_info("zygote_probe: [2c-3b] native policy allow %s "
+			pr_info("zygote_probe: [2c-3b] load policy allow %s "
 				"failed: %d\n",
 				path, ret);
 	}
@@ -1013,7 +1013,7 @@ static int zp_stage_file_fd(const char *path,
 	if (policy_state) {
 		ret = yz_host_file_load_policy_allow_current(file, policy_state);
 		if (ret)
-			pr_info("zygote_probe: [2c-3b] native policy allow %s "
+			pr_info("zygote_probe: [2c-3b] load policy allow %s "
 				"failed: %d\n",
 				path, ret);
 	}
@@ -1374,11 +1374,12 @@ static void zp_inject_tw_func(struct callback_head *cb)
 		zp_cache_name(core_name, sizeof(core_name));
 		if (yuki)
 			loader_fd = zp_stage_fd(loader_path, loader_name,
-						native ? &native_policy : NULL);
+						&native_policy);
 		else if (native)
 			loader_fd = zp_stage_file_fd(core_path, &native_policy);
 		else
-			loader_fd = zp_stage_fd(core_path, core_name, NULL);
+			loader_fd = zp_stage_fd(core_path, core_name,
+						&native_policy);
 		if (loader_fd < 0) {
 			pr_info("zygote_probe: [2c-3b] pid=%d socket=%s stage "
 				"loader "
@@ -1421,7 +1422,7 @@ static void zp_inject_tw_func(struct callback_head *cb)
 			}
 			early_packet_arg = early_packet.packet_fd + 1;
 		}
-		if (native) {
+		{
 			int ret = yz_host_file_load_policy_allow_execmem_current(
 			    &native_policy);
 
@@ -1520,7 +1521,7 @@ static void zp_inject_tw_func(struct callback_head *cb)
 				zp_close_current_fd(core_fd);
 			zp_close_early_packet_state(&early_packet);
 			zp_restore_native_policy_state(&native_policy);
-		} else if (native) {
+		} else {
 			zp_publish_native_policy_state(current->tgid,
 						       &native_policy);
 		}
