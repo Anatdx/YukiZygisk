@@ -2228,6 +2228,25 @@ constexpr char kCorePath[] = "/data/adb/ksu/lib/yukizygisk/libzygisk.so";
 
 extern "C" {
 
+#if !defined(YUKILINKER_BOOTSTRAP)
+// The core must never retain the first-stage loader's exported entry points.
+// These hidden aliases bind directly to the copy of yukilinker compiled into
+// the core; the bootstrap-only exports below remain the stage-one ABI.
+[[gnu::visibility("hidden")]] void *
+yuki_core_dlopen_memfd(int memfd, const char *vma_name) {
+  return yukilinker::dlopen_memfd(memfd, vma_name, true);
+}
+
+[[gnu::visibility("hidden")]] void *yuki_core_dlsym(void *handle,
+                                                    const char *name) {
+  return yukilinker::dlsym(static_cast<yukilinker::SoHandle *>(handle), name);
+}
+
+[[gnu::visibility("hidden")]] void yuki_core_dlclose(void *handle) {
+  yukilinker::dlclose(static_cast<yukilinker::SoHandle *>(handle));
+}
+#endif // !defined(YUKILINKER_BOOTSTRAP)
+
 [[gnu::visibility("default")]] void *yuki_dlopen_memfd(int memfd,
                                                        const char *vma_name) {
   return yukilinker::dlopen_memfd(memfd, vma_name, true);
