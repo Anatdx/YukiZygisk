@@ -84,6 +84,57 @@ static int yz_ioctl_restore_native_load_policy(void __user *arg)
 	return yz_zygote_probe_restore_native_policy((pid_t)cmd.pid);
 }
 
+static int yz_ioctl_allow_module_load_policy(void __user *arg)
+{
+	struct yz_module_load_policy_cmd cmd;
+	struct task_struct *task;
+	const struct cred *cred;
+	struct fd dir;
+	int ret;
+
+	if (copy_from_user(&cmd, arg, sizeof(cmd)))
+		return -EFAULT;
+	if (!cmd.pid || cmd.dirfd < 0)
+		return -EINVAL;
+
+	rcu_read_lock();
+	task = get_pid_task(find_vpid(cmd.pid), PIDTYPE_PID);
+	rcu_read_unlock();
+	if (!task)
+		return -ESRCH;
+
+	cred = get_task_cred(task);
+	if (!yz_host_is_zygote(cred)) {
+		pr_info("yukizygisk: module policy reject pid=%u outside zygote domain\n",
+			cmd.pid);
+		put_cred(cred);
+		put_task_struct(task);
+		return -EPERM;
+	}
+
+	dir = fdget(cmd.dirfd);
+	if (!fd_file(dir)) {
+		put_cred(cred);
+		put_task_struct(task);
+		return -EBADF;
+	}
+	if (!S_ISDIR(file_inode(fd_file(dir))->i_mode)) {
+		fdput(dir);
+		put_cred(cred);
+		put_task_struct(task);
+		return -ENOTDIR;
+	}
+
+	ret = yz_zygote_probe_allow_module_policy((pid_t)cmd.pid,
+						    fd_file(dir), cred);
+	fdput(dir);
+	put_cred(cred);
+	put_task_struct(task);
+	pr_info("yukizygisk: module policy allow pid=%u fd=%d ret=%d\n",
+		cmd.pid, cmd.dirfd, ret);
+	return ret;
+}
+
 static int yz_ioctl_get_safemode(void __user *arg)
 {
 	struct yz_safemode_status_cmd cmd;
@@ -386,6 +437,8 @@ static long yukizygisk_ioctl(struct file *file, unsigned int request,
 		return yz_ioctl_get_zygote_variants(uarg);
 	case YZ_IOCTL_PREPARE_RUNTIME_POLICY:
 		return yz_host_prepare_runtime_policy();
+	case YZ_IOCTL_ALLOW_MODULE_LOAD_POLICY:
+		return yz_ioctl_allow_module_load_policy(uarg);
 	default:
 		return -ENOTTY;
 	}

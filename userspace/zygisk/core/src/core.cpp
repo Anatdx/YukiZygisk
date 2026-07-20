@@ -77,6 +77,7 @@ int zd_module_dir(int id);
 int zd_connect_companion(int id);
 uint32_t zd_get_flags(int uid);
 int g_app_uid = -1; // uid of the process currently being specialized
+bool g_module_policy_armed = false;
 
 void api_hook_jni_native_methods(JNIEnv *env, const char *cls,
                                  JNINativeMethod *methods, int n) {
@@ -136,7 +137,10 @@ void api_set_option(void * /*impl*/, Option opt) {
 
 int api_get_module_dir(void * /*impl*/) {
   // Fresh fd; fork sanitization closes it unless exempted.
-  return g_cur != nullptr ? zd_module_dir(g_cur->id) : -1;
+  int fd = g_cur != nullptr ? zd_module_dir(g_cur->id) : -1;
+  if (fd >= 0)
+    g_module_policy_armed = true;
+  return fd;
 }
 
 uint32_t api_get_flags(void * /*impl*/) { return zd_get_flags(g_app_uid); }
@@ -359,6 +363,13 @@ void zd_restore_load_policy() {
   close(s);
 }
 
+void zd_restore_module_load_policy() {
+  if (!g_module_policy_armed)
+    return;
+  zd_restore_load_policy();
+  g_module_policy_armed = false;
+}
+
 /* dmesg logging via zygiskd. */
 extern "C" void yz_klog(const char *fmt, ...) {
   if (g_yz_config.dmesg_log == 0)
@@ -556,6 +567,7 @@ void run_app_pre_impl(zygisk::AppSpecializeArgs *args) {
                                   app_args_for(m, args, &v1args)));
     }
   g_cur = nullptr;
+  zd_restore_module_load_policy();
 }
 
 /* Hide injected linker entries. */
@@ -610,6 +622,7 @@ void run_server_pre_impl(zygisk::ServerSpecializeArgs *args) {
     }
   }
   g_cur = nullptr;
+  zd_restore_module_load_policy();
 }
 
 void run_server_post_impl(const zygisk::ServerSpecializeArgs *args) {

@@ -24,9 +24,12 @@ struct yz_file_load_policy {
 	u32 process_type;
 	u16 target_class;
 	u16 process_class;
+	u16 dir_class;
+	u16 reserved;
 	u32 added_av;
 	u32 tmpfs_added_av;
 	u32 process_added_av;
+	u32 dir_added_av;
 };
 
 struct yz_host_root_status {
@@ -51,6 +54,9 @@ int yz_host_prepare_runtime_policy(void);
 
 int yz_host_file_load_policy_allow_current(
 	struct file *file, struct yz_file_load_policy *state);
+int yz_host_file_load_policy_allow_cred(
+	struct file *file, const struct cred *cred,
+	struct yz_file_load_policy *state);
 int yz_host_file_load_policy_allow_execmem_current(
 	struct yz_file_load_policy *state);
 int yz_host_file_load_policy_restore(const struct yz_file_load_policy *state);

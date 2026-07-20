@@ -83,6 +83,10 @@ static const char *const yz_file_load_perms[] = {
 	"read", "open", "getattr", "map", "execute",
 };
 
+static const char *const yz_dir_load_perms[] = {
+	"read", "open", "getattr", "search",
+};
+
 static const char *const yz_tmpfs_load_perms[] = {
 	"read", "write", "open", "getattr", "map", "execute",
 };
@@ -602,6 +606,8 @@ yz_policy_commit_edit_locked(struct yz_policy_edit *edit)
 
 int yz_policy_base_commit_allow_locked(const struct yz_policy_key *file_key,
 				       u32 file_av,
+				       const struct yz_policy_key *dir_key,
+				       u32 dir_av,
 				       const struct yz_policy_key *tmpfs_key,
 				       u32 tmpfs_av,
 				       const struct yz_policy_key *process_key,
@@ -610,7 +616,7 @@ int yz_policy_base_commit_allow_locked(const struct yz_policy_key *file_key,
 	struct yz_policy_edit edit;
 	int ret;
 
-	if (!file_av && !tmpfs_av && !process_av)
+	if (!file_av && !dir_av && !tmpfs_av && !process_av)
 		return 0;
 
 	ret = yz_policy_begin_edit_locked(&edit);
@@ -620,6 +626,12 @@ int yz_policy_base_commit_allow_locked(const struct yz_policy_key *file_key,
 	if (file_av) {
 		ret = yz_policy_apply_av(&edit.load_state.policy->policydb,
 					 file_key, file_av, true);
+		if (ret)
+			goto out_cancel;
+	}
+	if (dir_av) {
+		ret = yz_policy_apply_av(&edit.load_state.policy->policydb,
+					 dir_key, dir_av, true);
 		if (ret)
 			goto out_cancel;
 	}
@@ -646,13 +658,14 @@ out_cancel:
 
 int yz_policy_base_commit_restore_locked(
 	const struct yz_policy_key *file_key, u32 file_av,
+	const struct yz_policy_key *dir_key, u32 dir_av,
 	const struct yz_policy_key *tmpfs_key, u32 tmpfs_av,
 	const struct yz_policy_key *process_key, u32 process_av)
 {
 	struct yz_policy_edit edit;
 	int ret;
 
-	if (!file_av && !tmpfs_av && !process_av)
+	if (!file_av && !dir_av && !tmpfs_av && !process_av)
 		return 0;
 
 	ret = yz_policy_begin_edit_locked(&edit);
@@ -662,6 +675,12 @@ int yz_policy_base_commit_restore_locked(
 	if (file_av) {
 		ret = yz_policy_apply_av(&edit.load_state.policy->policydb,
 					 file_key, file_av, false);
+		if (ret)
+			goto out_cancel;
+	}
+	if (dir_av) {
+		ret = yz_policy_apply_av(&edit.load_state.policy->policydb,
+					 dir_key, dir_av, false);
 		if (ret)
 			goto out_cancel;
 	}
@@ -707,15 +726,14 @@ void yz_policy_base_unlock(void)
 }
 
 YZ_INDIRECT_CALL int
-yz_policy_base_get_file_load_keys(struct file *file,
-				  struct yz_policy_key *file_key,
-				  u32 *file_required_av,
-				  struct yz_policy_key *tmpfs_key,
-				  u32 *tmpfs_required_av,
-				  char *src_name, size_t src_name_size,
-				  char *tgt_name, size_t tgt_name_size)
+yz_policy_base_get_file_load_keys(
+	struct file *file, const struct cred *cred, bool include_dir,
+	bool include_tmpfs, struct yz_policy_file_load_keys *keys,
+	char *src_name, size_t src_name_size, char *tgt_name,
+	size_t tgt_name_size)
 {
 	struct inode_security_struct *isec;
+	struct task_security_struct *tsec;
 	struct selinux_policy *policy;
 	struct policydb *db;
 	struct context *scontext;
@@ -725,20 +743,17 @@ yz_policy_base_get_file_load_keys(struct file *file,
 	u32 tsid;
 	u32 tmpfs_type;
 
-	if (!file || !file_key || !file_required_av || !tmpfs_key ||
-	    !tmpfs_required_av)
+	if (!file || !cred || !keys)
 		return -EINVAL;
 
-	*file_key = (struct yz_policy_key){};
-	*tmpfs_key = (struct yz_policy_key){};
-	*file_required_av = 0;
-	*tmpfs_required_av = 0;
+	*keys = (struct yz_policy_file_load_keys){};
 
 	isec = yz_policy_inode_security(file_inode(file));
 	if (!isec)
 		return -EINVAL;
 
-	ssid = yz_policy_current_sid();
+	tsec = yz_policy_cred_security(cred);
+	ssid = tsec ? tsec->sid : 0;
 	tsid = isec->sid;
 	if (!ssid || !tsid)
 		return -EINVAL;
@@ -759,18 +774,34 @@ yz_policy_base_get_file_load_keys(struct file *file,
 	if (!cls || cls->value > U16_MAX)
 		return -ENOENT;
 
-	file_key->src_type = scontext->type;
-	file_key->tgt_type = tcontext->type;
-	file_key->tclass = (u16)cls->value;
-	*file_required_av = yz_policy_required_av(
+	keys->file.src_type = scontext->type;
+	keys->file.tgt_type = tcontext->type;
+	keys->file.tclass = (u16)cls->value;
+	keys->file_required_av = yz_policy_required_av(
 		cls, yz_file_load_perms, ARRAY_SIZE(yz_file_load_perms));
 
-	tmpfs_type = yz_policy_type_value_by_name(db, "tmpfs");
+	if (include_dir) {
+		cls = yz_symtab_search_ptr(&db->p_classes, "dir");
+		if (!cls || cls->value > U16_MAX)
+			return -ENOENT;
+		keys->dir.src_type = scontext->type;
+		keys->dir.tgt_type = tcontext->type;
+		keys->dir.tclass = (u16)cls->value;
+		keys->dir_required_av = yz_policy_required_av(
+			cls, yz_dir_load_perms, ARRAY_SIZE(yz_dir_load_perms));
+	}
+
+	tmpfs_type = include_tmpfs ?
+			     yz_policy_type_value_by_name(db, "tmpfs") :
+			     0;
 	if (tmpfs_type) {
-		tmpfs_key->src_type = scontext->type;
-		tmpfs_key->tgt_type = tmpfs_type;
-		tmpfs_key->tclass = (u16)cls->value;
-		*tmpfs_required_av = yz_policy_required_av(
+		cls = yz_symtab_search_ptr(&db->p_classes, "file");
+		if (!cls || cls->value > U16_MAX)
+			return -ENOENT;
+		keys->tmpfs.src_type = scontext->type;
+		keys->tmpfs.tgt_type = tmpfs_type;
+		keys->tmpfs.tclass = (u16)cls->value;
+		keys->tmpfs_required_av = yz_policy_required_av(
 			cls, yz_tmpfs_load_perms,
 			ARRAY_SIZE(yz_tmpfs_load_perms));
 	}

@@ -263,6 +263,14 @@ struct yz_zygote_variants_cmd {
 #define YZ_IOCTL_PREPARE_RUNTIME_POLICY \
 	_IOC(_IOC_NONE, YZ_IOCTL_MAGIC, 65, 0)
 
+#define YZ_IOCTL_ALLOW_MODULE_LOAD_POLICY \
+	_IOC(_IOC_WRITE, YZ_IOCTL_MAGIC, 66, 0)
+
+struct yz_module_load_policy_cmd {
+	__u32 pid;
+	__s32 dirfd;
+};
+
 struct yz_config {
 	__u8 yukilinker;
 	__u8 denylist_mode;

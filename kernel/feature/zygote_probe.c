@@ -105,6 +105,7 @@ static unsigned long zp_early_native_retry_deadline;
 static bool zp_early_native_missing_logged;
 
 #define ZP_NATIVE_POLICY_TIMEOUT (10 * HZ)
+#define ZP_MODULE_POLICY_TIMEOUT (10 * HZ)
 #define ZP_EARLY_NATIVE_RETRY_WINDOW (15 * HZ)
 
 struct zp_native_policy_pending {
@@ -118,11 +119,24 @@ struct zp_native_policy_pending {
 static DEFINE_MUTEX(zp_native_policy_lock);
 static LIST_HEAD(zp_native_policy_pending);
 
+struct zp_module_policy_holder {
+	struct list_head list;
+	pid_t tgid;
+	struct yz_file_load_policy state;
+	struct delayed_work timeout;
+	bool pending;
+};
+
+static DEFINE_MUTEX(zp_module_policy_lock);
+static LIST_HEAD(zp_module_policy_holders);
+
+static int zp_restore_module_policy(pid_t tgid);
+
 static bool
 zp_native_policy_has_additions(const struct yz_file_load_policy *state)
 {
 	return state && (state->added_av || state->tmpfs_added_av ||
-			 state->process_added_av);
+			 state->process_added_av || state->dir_added_av);
 }
 
 void yz_zygote_probe_set_yukilinker(bool enabled)
@@ -276,7 +290,146 @@ int yz_zygote_probe_restore_native_policy(pid_t tgid)
 	}
 	pr_info("zygote_probe: load policy restore pid=%d entries=%d\n", tgid,
 		n);
-	return 0;
+	return zp_restore_module_policy(tgid);
+}
+
+static bool zp_module_policy_same(
+	const struct zp_module_policy_holder *holder, pid_t tgid,
+	const struct yz_file_load_policy *state)
+{
+	return holder->pending && holder->tgid == tgid &&
+	       holder->state.src_type == state->src_type &&
+	       holder->state.tgt_type == state->tgt_type &&
+	       holder->state.target_class == state->target_class &&
+	       holder->state.dir_class == state->dir_class;
+}
+
+static void zp_module_policy_timeout(struct work_struct *work)
+{
+	struct zp_module_policy_holder *holder = container_of(
+	    to_delayed_work(work), struct zp_module_policy_holder, timeout);
+	bool restore = false;
+
+	mutex_lock(&zp_module_policy_lock);
+	if (holder->pending) {
+		holder->pending = false;
+		list_del_init(&holder->list);
+		restore = true;
+	}
+	mutex_unlock(&zp_module_policy_lock);
+
+	if (!restore)
+		return;
+
+	pr_info("zygote_probe: module policy timeout pid=%d src=%u tgt=%u\n",
+		holder->tgid, holder->state.src_type,
+		holder->state.tgt_type);
+	zp_restore_native_policy_state(&holder->state);
+	kfree(holder);
+}
+
+int yz_zygote_probe_allow_module_policy(pid_t tgid, struct file *dir,
+					const struct cred *cred)
+{
+	struct zp_module_policy_holder *holder;
+	struct zp_module_policy_holder *cur;
+	struct yz_file_load_policy state;
+	int ret;
+
+	if (tgid <= 0 || !dir || !cred)
+		return -EINVAL;
+
+	holder = kzalloc(sizeof(*holder), GFP_KERNEL);
+	if (!holder)
+		return -ENOMEM;
+
+	mutex_lock(&zp_module_policy_lock);
+	ret = yz_host_file_load_policy_allow_cred(dir, cred, &state);
+	if (ret)
+		goto out_unlock;
+	if (!zp_native_policy_has_additions(&state))
+		goto out_unlock;
+
+	list_for_each_entry (cur, &zp_module_policy_holders, list) {
+		if (!zp_module_policy_same(cur, tgid, &state))
+			continue;
+		ret = yz_host_file_load_policy_restore(&state);
+		goto out_unlock;
+	}
+
+	holder->tgid = tgid;
+	holder->state = state;
+	holder->pending = true;
+	INIT_LIST_HEAD(&holder->list);
+	INIT_DELAYED_WORK(&holder->timeout, zp_module_policy_timeout);
+	list_add_tail(&holder->list, &zp_module_policy_holders);
+	schedule_delayed_work(&holder->timeout, ZP_MODULE_POLICY_TIMEOUT);
+	pr_info("zygote_probe: module policy armed pid=%d src=%u tgt=%u file=0x%x dir=0x%x\n",
+		tgid, state.src_type, state.tgt_type, state.added_av,
+		state.dir_added_av);
+	holder = NULL;
+
+out_unlock:
+	mutex_unlock(&zp_module_policy_lock);
+	kfree(holder);
+	return ret;
+}
+
+static int zp_restore_module_policy(pid_t tgid)
+{
+	struct zp_module_policy_holder *holder;
+	struct zp_module_policy_holder *tmp;
+	LIST_HEAD(todo);
+	int first_error = 0;
+	int n = 0;
+
+	mutex_lock(&zp_module_policy_lock);
+	list_for_each_entry_safe (holder, tmp, &zp_module_policy_holders,
+				  list) {
+		if (!holder->pending || holder->tgid != tgid)
+			continue;
+		holder->pending = false;
+		list_move_tail(&holder->list, &todo);
+	}
+	mutex_unlock(&zp_module_policy_lock);
+
+	list_for_each_entry_safe (holder, tmp, &todo, list) {
+		int ret;
+
+		cancel_delayed_work_sync(&holder->timeout);
+		list_del(&holder->list);
+		ret = yz_host_file_load_policy_restore(&holder->state);
+		if (ret && !first_error)
+			first_error = ret;
+		kfree(holder);
+		n++;
+	}
+	if (n)
+		pr_info("zygote_probe: module policy restore pid=%d entries=%d ret=%d\n",
+			tgid, n, first_error);
+	return first_error;
+}
+
+static void zp_cleanup_module_policies(void)
+{
+	struct zp_module_policy_holder *holder;
+	struct zp_module_policy_holder *tmp;
+	LIST_HEAD(todo);
+
+	mutex_lock(&zp_module_policy_lock);
+	list_for_each_entry_safe (holder, tmp, &zp_module_policy_holders,
+				  list) {
+		holder->pending = false;
+		list_move_tail(&holder->list, &todo);
+	}
+	mutex_unlock(&zp_module_policy_lock);
+
+	list_for_each_entry_safe (holder, tmp, &todo, list) {
+		cancel_delayed_work_sync(&holder->timeout);
+		list_del(&holder->list);
+		zp_restore_native_policy_state(&holder->state);
+		kfree(holder);
+	}
 }
 
 /* Patch a movz/movk x<d> sequence. */
@@ -1619,6 +1772,7 @@ void yz_zygote_probe_init(void)
 
 void yz_zygote_probe_exit(void)
 {
+	zp_cleanup_module_policies();
 #if ZP_ENABLE_LSM_INJECTOR
 	if (zp_enable_lsm_injector)
 		yz_host_unregister_lsm_hook(&zygote_probe_hook);

@@ -24,6 +24,8 @@ bool yz_host_policy_cred_has_type(const struct cred *cred,
 int yz_host_policy_prepare_runtime_current(void);
 int yz_host_policy_allow_file_current(struct file *file,
 				      struct yz_file_load_policy *state);
+int yz_host_policy_allow_file_cred(struct file *file, const struct cred *cred,
+				   struct yz_file_load_policy *state);
 int yz_host_policy_allow_execmem_current(struct yz_file_load_policy *state);
 int yz_host_policy_restore(const struct yz_file_load_policy *state);
 

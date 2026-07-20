@@ -104,6 +104,13 @@ int yz_host_file_load_policy_allow_current(
 	return yz_host_policy_allow_file_current(file, state);
 }
 
+int yz_host_file_load_policy_allow_cred(
+	struct file *file, const struct cred *cred,
+	struct yz_file_load_policy *state)
+{
+	return yz_host_policy_allow_file_cred(file, cred, state);
+}
+
 int yz_host_file_load_policy_allow_execmem_current(
 	struct yz_file_load_policy *state)
 {

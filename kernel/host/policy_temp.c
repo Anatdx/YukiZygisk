@@ -229,20 +229,19 @@ static int yz_policy_temp_plan_allow_locked(const struct yz_policy_key *key,
 	return 0;
 }
 
-int yz_host_policy_allow_file_current(struct file *file,
-				      struct yz_file_load_policy *state)
+static int yz_host_policy_allow_file(
+	struct file *file, const struct cred *cred, bool include_dir,
+	bool include_tmpfs, struct yz_file_load_policy *state)
 {
-	struct yz_policy_key file_key = {};
-	struct yz_policy_key tmpfs_key = {};
-	u32 file_required_av = 0;
-	u32 tmpfs_required_av = 0;
+	struct yz_policy_file_load_keys keys = {};
 	u32 file_commit_av = 0;
+	u32 dir_commit_av = 0;
 	u32 tmpfs_commit_av = 0;
 	char src_name[YZ_POLICY_TYPE_NAME_MAX];
 	char tgt_name[YZ_POLICY_TYPE_NAME_MAX];
 	int ret;
 
-	if (!file || !state)
+	if (!file || !cred || !state)
 		return -EINVAL;
 	memset(state, 0, sizeof(*state));
 
@@ -251,43 +250,55 @@ int yz_host_policy_allow_file_current(struct file *file,
 		return ret;
 
 	ret = yz_policy_base_get_file_load_keys(
-		file, &file_key, &file_required_av, &tmpfs_key,
-		&tmpfs_required_av, src_name, sizeof(src_name), tgt_name,
-		sizeof(tgt_name));
+		file, cred, include_dir, include_tmpfs, &keys, src_name,
+		sizeof(src_name), tgt_name, sizeof(tgt_name));
 	if (ret)
 		goto out_unlock;
 
-	ret = yz_policy_temp_plan_allow_locked(&file_key, file_required_av,
+	ret = yz_policy_temp_plan_allow_locked(&keys.file,
+					       keys.file_required_av,
 					       &state->added_av,
 					       &file_commit_av);
 	if (ret)
 		goto out_unlock;
 
-	if (tmpfs_required_av) {
+	if (keys.dir_required_av) {
 		ret = yz_policy_temp_plan_allow_locked(
-			&tmpfs_key, tmpfs_required_av,
+			&keys.dir, keys.dir_required_av, &state->dir_added_av,
+			&dir_commit_av);
+		if (ret)
+			goto out_clear_state;
+	}
+
+	if (keys.tmpfs_required_av) {
+		ret = yz_policy_temp_plan_allow_locked(
+			&keys.tmpfs, keys.tmpfs_required_av,
 			&state->tmpfs_added_av, &tmpfs_commit_av);
 		if (ret)
 			goto out_clear_state;
 	}
 
-	state->src_type = file_key.src_type;
-	state->tgt_type = file_key.tgt_type;
-	state->tmpfs_type = tmpfs_key.tgt_type;
-	state->target_class = file_key.tclass;
+	state->src_type = keys.file.src_type;
+	state->tgt_type = keys.file.tgt_type;
+	state->tmpfs_type = keys.tmpfs.tgt_type;
+	state->target_class = keys.file.tclass;
+	state->dir_class = keys.dir.tclass;
 
 	ret = yz_policy_base_commit_allow_locked(
-		&file_key, file_commit_av, &tmpfs_key, tmpfs_commit_av, NULL,
-		0);
+		&keys.file, file_commit_av, &keys.dir, dir_commit_av,
+		&keys.tmpfs, tmpfs_commit_av, NULL, 0);
 	if (ret)
 		goto out_clear_state;
 
-	yz_policy_temp_add_locked(&file_key, state->added_av);
-	yz_policy_temp_add_locked(&tmpfs_key, state->tmpfs_added_av);
+	yz_policy_temp_add_locked(&keys.file, state->added_av);
+	yz_policy_temp_add_locked(&keys.dir, state->dir_added_av);
+	yz_policy_temp_add_locked(&keys.tmpfs, state->tmpfs_added_av);
 
-	if (state->added_av || state->tmpfs_added_av)
-		pr_info("yukizygisk: policy allow src=%s tgt=%s file=0x%x tmpfs=0x%x\n",
+	if (state->added_av || state->dir_added_av ||
+	    state->tmpfs_added_av)
+		pr_info("yukizygisk: policy allow src=%s tgt=%s file=0x%x dir=0x%x tmpfs=0x%x\n",
 			src_name, tgt_name, state->added_av,
+			state->dir_added_av,
 			state->tmpfs_added_av);
 	goto out_unlock;
 
@@ -297,6 +308,19 @@ out_clear_state:
 out_unlock:
 	yz_policy_base_unlock();
 	return ret;
+}
+
+int yz_host_policy_allow_file_current(struct file *file,
+				      struct yz_file_load_policy *state)
+{
+	return yz_host_policy_allow_file(file, current_cred(), false, true,
+					 state);
+}
+
+int yz_host_policy_allow_file_cred(struct file *file, const struct cred *cred,
+				   struct yz_file_load_policy *state)
+{
+	return yz_host_policy_allow_file(file, cred, true, false, state);
 }
 
 int yz_host_policy_allow_execmem_current(struct yz_file_load_policy *state)
@@ -330,8 +354,8 @@ int yz_host_policy_allow_execmem_current(struct yz_file_load_policy *state)
 	state->process_type = key.src_type;
 	state->process_class = key.tclass;
 
-	ret = yz_policy_base_commit_allow_locked(NULL, 0, NULL, 0, &key,
-						 commit_av);
+	ret = yz_policy_base_commit_allow_locked(NULL, 0, NULL, 0, NULL, 0,
+						 &key, commit_av);
 	if (ret) {
 		state->process_type = 0;
 		state->process_class = 0;
@@ -353,20 +377,25 @@ out_unlock:
 int yz_host_policy_restore(const struct yz_file_load_policy *state)
 {
 	struct yz_policy_key file_key = {};
+	struct yz_policy_key dir_key = {};
 	struct yz_policy_key tmpfs_key = {};
 	struct yz_policy_key process_key = {};
 	u32 file_clear_av = 0;
+	u32 dir_clear_av = 0;
 	u32 tmpfs_clear_av = 0;
 	u32 process_clear_av = 0;
 	int ret;
 
 	if (!state || (!state->added_av && !state->tmpfs_added_av &&
-		       !state->process_added_av))
+		       !state->process_added_av && !state->dir_added_av))
 		return 0;
 
 	file_key.src_type = state->src_type;
 	file_key.tgt_type = state->tgt_type;
 	file_key.tclass = state->target_class;
+	dir_key.src_type = state->src_type;
+	dir_key.tgt_type = state->tgt_type;
+	dir_key.tclass = state->dir_class;
 	tmpfs_key.src_type = state->src_type;
 	tmpfs_key.tgt_type = state->tmpfs_type;
 	tmpfs_key.tclass = state->target_class;
@@ -381,6 +410,9 @@ int yz_host_policy_restore(const struct yz_file_load_policy *state)
 	if (state->added_av)
 		file_clear_av = yz_policy_temp_plan_release_locked(
 			&file_key, state->added_av);
+	if (state->dir_added_av)
+		dir_clear_av = yz_policy_temp_plan_release_locked(
+			&dir_key, state->dir_added_av);
 	if (state->tmpfs_added_av)
 		tmpfs_clear_av = yz_policy_temp_plan_release_locked(
 			&tmpfs_key, state->tmpfs_added_av);
@@ -389,16 +421,18 @@ int yz_host_policy_restore(const struct yz_file_load_policy *state)
 			&process_key, state->process_added_av);
 
 	ret = yz_policy_base_commit_restore_locked(
-		&file_key, file_clear_av, &tmpfs_key, tmpfs_clear_av,
-		&process_key, process_clear_av);
+		&file_key, file_clear_av, &dir_key, dir_clear_av, &tmpfs_key,
+		tmpfs_clear_av, &process_key, process_clear_av);
 	if (!ret) {
 		yz_policy_temp_release_locked(&file_key, state->added_av);
+		yz_policy_temp_release_locked(&dir_key, state->dir_added_av);
 		yz_policy_temp_release_locked(&tmpfs_key,
 					      state->tmpfs_added_av);
 		yz_policy_temp_release_locked(&process_key,
 					      state->process_added_av);
-		pr_info("yukizygisk: policy restore file=0x%x tmpfs=0x%x process=0x%x\n",
-			file_clear_av, tmpfs_clear_av, process_clear_av);
+		pr_info("yukizygisk: policy restore file=0x%x dir=0x%x tmpfs=0x%x process=0x%x\n",
+			file_clear_av, dir_clear_av, tmpfs_clear_av,
+			process_clear_av);
 	}
 
 	yz_policy_base_unlock();

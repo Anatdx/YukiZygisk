@@ -1653,9 +1653,35 @@ void handle_client(int client) {
     }
     std::string dir = yzhost::modules_dir() + "/" + g_modules[idx].name;
     int fd = open(dir.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
-    send_fd(client, fd);
+    struct ucred cr{};
+    socklen_t crlen = sizeof(cr);
+    bool policy_armed = false;
+    if (fd >= 0 &&
+        getsockopt(client, SOL_SOCKET, SO_PEERCRED, &cr, &crlen) == 0 &&
+        cr.pid > 0) {
+      yz_module_load_policy_cmd cmd{};
+      cmd.pid = static_cast<uint32_t>(cr.pid);
+      cmd.dirfd = fd;
+      int ret = yzhost::ctl(YZ_IOCTL_ALLOW_MODULE_LOAD_POLICY, &cmd);
+      policy_armed = ret == 0;
+      DLOGI("module dir policy: module=%s pid=%d ret=%d",
+            g_modules[idx].name.c_str(), cr.pid, ret);
+      if (!policy_armed) {
+        close(fd);
+        fd = -1;
+      }
+    } else if (fd >= 0) {
+      close(fd);
+      fd = -1;
+    }
+    bool sent = send_fd(client, fd);
     if (fd >= 0)
       close(fd);
+    if (!sent && policy_armed) {
+      yz_native_load_policy_cmd cmd{};
+      cmd.pid = static_cast<uint32_t>(cr.pid);
+      (void)yzhost::ctl(YZ_IOCTL_RESTORE_NATIVE_LOAD_POLICY, &cmd);
+    }
     break;
   }
   case zygiskd::Request::GetProcessFlags: {
